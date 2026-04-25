@@ -751,6 +751,45 @@ def _build_loss_guard_callback():
 
 
 # --------------------------------------------------------------------------- #
+# Milestone checkpoint saver                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _build_milestone_save_callback(*, model, tokenizer, output_dir: str, milestones):
+    """Snapshot the LoRA adapter at specific step numbers.
+
+    Each milestone N writes ``{output_dir}/step-N/`` independent of HF's
+    regular ``save_steps`` rotation (which is bounded by ``save_total_limit``
+    and would discard early checkpoints by the end of training). The
+    snapshots are adapter-only, so a later GRPO run can resume from any of
+    them via ``--sft-checkpoint {output_dir}/step-N``.
+    """
+    from transformers import TrainerCallback
+
+    milestones_set = {int(m) for m in milestones}
+
+    class _MilestoneSave(TrainerCallback):
+        already_saved: set[int] = set()
+
+        def on_step_end(self, args, state, control, **kwargs):  # noqa: D401
+            step = int(state.global_step)
+            if step not in milestones_set or step in self.already_saved:
+                return
+            self.already_saved.add(step)
+            save_path = Path(output_dir) / f"step-{step}"
+            save_path.mkdir(parents=True, exist_ok=True)
+            try:
+                model.save_pretrained(str(save_path))
+                tokenizer.save_pretrained(str(save_path))
+                print(f"[sft] milestone checkpoint saved at step={step} -> {save_path}")
+            except Exception as exc:
+                print(f"[sft] WARNING: failed to save milestone at step={step}: {exc}",
+                      file=sys.stderr)
+
+    return _MilestoneSave()
+
+
+# --------------------------------------------------------------------------- #
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
 
@@ -796,6 +835,12 @@ def main(argv: Iterable[str] = ()) -> int:
     parser.add_argument("--diversity-samples", type=int, default=10,
                         help="N samples for the output_diversity probe")
     parser.add_argument("--diversity-temperature", type=float, default=0.7)
+    parser.add_argument("--milestone-steps", type=int, nargs="*",
+                        default=(5, 15, 30, 50, 100, 150, 200),
+                        help="step numbers at which to snapshot the LoRA "
+                             "adapter into {output}/step-N/ for later GRPO "
+                             "resumption. Pass `--milestone-steps` with no "
+                             "values to disable.")
     parser.add_argument("--no-artifact", action="store_true")
     args = parser.parse_args(list(argv))
 
@@ -993,6 +1038,16 @@ def main(argv: Iterable[str] = ()) -> int:
     )
     if val_cb is not None:
         callbacks.append(val_cb)
+
+    if args.milestone_steps:
+        callbacks.append(_build_milestone_save_callback(
+            model=model,
+            tokenizer=tokenizer,
+            output_dir=args.output,
+            milestones=args.milestone_steps,
+        ))
+        print(f"[sft] milestone checkpoints will be saved at steps: "
+              f"{sorted(set(args.milestone_steps))}")
 
     trainer = SFTTrainer(
         model=model,
