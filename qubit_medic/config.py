@@ -196,7 +196,14 @@ SFT_MAX_STEPS: int = 200             # hard cap; 3000/16=187.5 expected
 SFT_EVAL_EVERY: int = 50             # legacy fallback if no schedule given
 SFT_SAVE_EVERY: int = 50
 SFT_LOG_EVERY: int = 10
-SFT_MAX_NEW_TOKENS: int = 128        # generation cap during eval
+SFT_MAX_NEW_TOKENS: int = 200        # generation cap during eval
+# Was 128; bumped to 200 because Qwen2.5-Instruct's cold-start reasoning
+# (### Analysis: 1. ... 2. ... 3. ...) regularly runs to 100+ tokens
+# before reaching the format line in early SFT steps. With 128, every
+# step-5 sample truncated mid-reasoning and format_compliance read 0.
+# 200 gives ~70 tokens of headroom past a typical reasoning + format
+# completion (~70 tokens total) so truncation never masks the model's
+# real behaviour.
 
 # --- Variable eval cadence ------------------------------------------------- #
 # Early evals are quick sanity checks (small sample, format-only) so a

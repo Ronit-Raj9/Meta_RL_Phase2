@@ -260,12 +260,22 @@ def run_context(run_name: str, job_type: str, **kwargs):
 
 def log(metrics: Mapping[str, Any], *, step: Optional[int] = None,
         commit: bool = True) -> None:
-    """No-op-safe ``wandb.log`` wrapper."""
+    """No-op-safe ``wandb.log`` wrapper.
+
+    We store training-step alignment as an explicit scalar
+    ``train/global_step`` instead of passing W&B's reserved ``step=`` value.
+    HuggingFace/TRL may advance W&B's internal step before our callback logs,
+    which otherwise produces "Tried to log to step N that is less than the
+    current step N+1" and drops eval metrics.
+    """
     wandb = _import_wandb()
     if wandb is None or _RUN is None:
         return
     try:
-        wandb.log(dict(metrics), step=step, commit=commit)
+        payload = dict(metrics)
+        if step is not None and "train/global_step" not in payload:
+            payload["train/global_step"] = int(step)
+        wandb.log(payload, commit=commit)
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[wandb] log failed: {exc}", file=sys.stderr)
 

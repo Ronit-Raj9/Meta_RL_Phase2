@@ -58,15 +58,13 @@ from qubit_medic.server.physics import (
 
 
 # --------------------------------------------------------------------------- #
-# Reasoning-prefix helper                                                     #
+# Optional reasoning helper                                                   #
 # --------------------------------------------------------------------------- #
-# The locked prompt (qubit_medic/prompts.py) tells the model to "Reason
-# briefly (1-2 sentences), then output your answer on the LAST line in this
-# EXACT format". A bare-format-line target contradicts that, so we emit a
-# 1-sentence template derived deterministically from (px, pz) and then the
-# canonical format line. Prompt and target now agree, eliminating the
-# oscillation that drove format_compliance from 0.54 -> 0.04 between
-# step 30 and step 50 of the original SFT run.
+# Earlier revisions emitted a short reasoning sentence before the canonical
+# format line. The step-5 / step-15 raw outputs showed Qwen copying that too
+# eagerly: it spent the whole 128-token eval budget on generic analysis and
+# never reached ``X_ERRORS=[...] Z_ERRORS=[...]``. SFT warmup needs to teach
+# the parser contract first, so the active target below is format-line-only.
 
 
 def _build_reasoning(px: list[int], pz: list[int]) -> str:
@@ -232,117 +230,130 @@ def _generate_split(
     call, chunked ``sample()``) so generation is ~1 second per level even
     when the floor demands tens of thousands of shots.
     """
-    written = n_with_syndrome = n_with_errors = 0
+    n_with_syndrome = n_with_errors = 0
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # rng kept for caller-API compatibility; sampling determinism is
-    # driven by ``seed`` + per-level offsets.
-    del rng
+    # Buffer all records in memory then shuffle before writing. This is
+    # critical: per-level generation produces L1-block / L2-block / L3-block
+    # contiguously, which (a) makes SFTTrainer's first batches all-L1 even
+    # though Trainer shuffles per-epoch, and (b) makes the validation
+    # callback's "first N samples" display all-L1 -- hiding model behaviour
+    # on L2/L3 prompts. A deterministic shuffle keyed off `rng` (the
+    # caller-passed random.Random) gives us level-mixed streams while
+    # keeping `--seed N` fully reproducible.
+    records: list[dict] = []
+
+    for level_name, level_n in quotas.items():
+        cache = caches[level_name]
+        layout = cache["layout"]
+        floor = PER_LEVEL_NONEMPTY_FLOOR.get(level_name)
+
+        if floor is None:
+            target_nonempty = None
+            target_empty = None
+        else:
+            target_nonempty = int(round(level_n * floor))
+            target_empty = level_n - target_nonempty
+
+        level_nonempty = 0
+        level_empty = 0
+        shots_drawn = 0
+        level_seed = seed + _LEVEL_SEED_OFFSETS.get(level_name, 0)
+        shots = _level_shot_stream(cache, level_seed)
+
+        while (level_nonempty + level_empty) < level_n:
+            if shots_drawn >= _MAX_SHOTS_PER_LEVEL:
+                raise RuntimeError(
+                    f"[gen] level {level_name}: exceeded "
+                    f"_MAX_SHOTS_PER_LEVEL={_MAX_SHOTS_PER_LEVEL} with "
+                    f"only {level_nonempty} non-empty + {level_empty} "
+                    f"empty rows (target: {target_nonempty} non-empty + "
+                    f"{target_empty} empty). Either lower "
+                    f"PER_LEVEL_NONEMPTY_FLOOR[{level_name!r}] or "
+                    f"raise the level's physical error rate in "
+                    f"qubit_medic/config.py."
+                )
+            det_row, obs_row = next(shots)
+            shots_drawn += 1
+
+            # Optimal correction via PyMatching (X + Z Pauli frame).
+            px_stim, pz_stim = pymatching_predicted_pauli_frame(
+                cache["matching"], det_row, layout,
+            )
+            pm_obs = int(cache["matching"].decode(det_row)[0])
+            px_stim, pz_stim = rectify_pauli_frame_to_observable(
+                px_stim, pz_stim, pm_obs, layout,
+            )
+            # LLM ID space (consecutive 0..N-1).
+            px = layout.stim_to_llm(px_stim)
+            pz = layout.stim_to_llm(pz_stim)
+            is_nonempty = bool(px or pz)
+
+            # Per-level quota acceptance:
+            if floor is None:
+                pass  # accept anything until level_n is filled
+            elif is_nonempty:
+                if level_nonempty >= target_nonempty:
+                    continue  # surplus non-empty for this level
+            else:
+                if level_empty >= target_empty:
+                    continue  # surplus empty for this level
+
+            actual_obs = int(obs_row[0]) if obs_row.shape[0] else 0
+
+            prompt = build_prompt(
+                distance=cache["level"].distance,
+                rounds=cache["level"].rounds,
+                p=cache["level"].p,
+                syndrome_bits=det_row.tolist(),
+                num_x_stabilizers=cache["n_x_stab"],
+                num_z_stabilizers=cache["n_z_stab"],
+                num_data_qubits=layout.num_data_qubits,
+            )
+            completion = format_completion(px, pz)
+            record = {
+                "prompt": prompt,
+                "completion": completion,
+                "level": level_name,
+                "distance": cache["level"].distance,
+                "rounds": cache["level"].rounds,
+                "p": cache["level"].p,
+                "num_data_qubits": int(layout.num_data_qubits),
+                "num_x_stabilizers": int(cache["n_x_stab"]),
+                "num_z_stabilizers": int(cache["n_z_stab"]),
+                "syndrome_bits": [int(b) for b in det_row.tolist()],
+                "true_x_errors": list(map(int, px)),
+                "true_z_errors": list(map(int, pz)),
+                "actual_observable_flip": actual_obs,
+                "pymatching_observable_pred": pm_obs,
+                "had_syndrome": bool(det_row.any()),
+                "had_errors": bool(px or pz),
+            }
+            records.append(record)
+            if record["had_errors"]:
+                n_with_errors += 1
+                level_nonempty += 1
+            else:
+                level_empty += 1
+            if record["had_syndrome"]:
+                n_with_syndrome += 1
+
+        print(f"  [{level_name}] {level_nonempty} non-empty + "
+              f"{level_empty} empty (drew {shots_drawn} shots, "
+              f"natural non-empty rate "
+              f"~{level_nonempty / max(1, shots_drawn):.1%})")
+
+    # Deterministic shuffle: same `seed` -> same row order, but no longer
+    # blocked by level. SFTTrainer's per-epoch shuffle still applies on top
+    # of this; the buffer-shuffle ensures every batch (and every eval
+    # display window) sees a representative L1/L2/L3 mix.
+    rng.shuffle(records)
 
     with out_path.open("w") as f:
-        for level_name, level_n in quotas.items():
-            cache = caches[level_name]
-            layout = cache["layout"]
-            floor = PER_LEVEL_NONEMPTY_FLOOR.get(level_name)
+        for record in records:
+            f.write(json.dumps(record) + "\n")
 
-            if floor is None:
-                target_nonempty = None
-                target_empty = None
-            else:
-                target_nonempty = int(round(level_n * floor))
-                target_empty = level_n - target_nonempty
-
-            level_nonempty = 0
-            level_empty = 0
-            shots_drawn = 0
-            level_seed = seed + _LEVEL_SEED_OFFSETS.get(level_name, 0)
-            shots = _level_shot_stream(cache, level_seed)
-
-            while (level_nonempty + level_empty) < level_n:
-                if shots_drawn >= _MAX_SHOTS_PER_LEVEL:
-                    raise RuntimeError(
-                        f"[gen] level {level_name}: exceeded "
-                        f"_MAX_SHOTS_PER_LEVEL={_MAX_SHOTS_PER_LEVEL} with "
-                        f"only {level_nonempty} non-empty + {level_empty} "
-                        f"empty rows (target: {target_nonempty} non-empty + "
-                        f"{target_empty} empty). Either lower "
-                        f"PER_LEVEL_NONEMPTY_FLOOR[{level_name!r}] or "
-                        f"raise the level's physical error rate in "
-                        f"qubit_medic/config.py."
-                    )
-                det_row, obs_row = next(shots)
-                shots_drawn += 1
-
-                # Optimal correction via PyMatching (X + Z Pauli frame).
-                px_stim, pz_stim = pymatching_predicted_pauli_frame(
-                    cache["matching"], det_row, layout,
-                )
-                pm_obs = int(cache["matching"].decode(det_row)[0])
-                px_stim, pz_stim = rectify_pauli_frame_to_observable(
-                    px_stim, pz_stim, pm_obs, layout,
-                )
-                # LLM ID space (consecutive 0..N-1).
-                px = layout.stim_to_llm(px_stim)
-                pz = layout.stim_to_llm(pz_stim)
-                is_nonempty = bool(px or pz)
-
-                # Per-level quota acceptance:
-                if floor is None:
-                    pass  # accept anything until level_n is filled
-                elif is_nonempty:
-                    if level_nonempty >= target_nonempty:
-                        continue  # surplus non-empty for this level
-                else:
-                    if level_empty >= target_empty:
-                        continue  # surplus empty for this level
-
-                actual_obs = int(obs_row[0]) if obs_row.shape[0] else 0
-
-                prompt = build_prompt(
-                    distance=cache["level"].distance,
-                    rounds=cache["level"].rounds,
-                    p=cache["level"].p,
-                    syndrome_bits=det_row.tolist(),
-                    num_x_stabilizers=cache["n_x_stab"],
-                    num_z_stabilizers=cache["n_z_stab"],
-                    num_data_qubits=layout.num_data_qubits,
-                )
-                reasoning = _build_reasoning(px, pz)
-                completion = f"{reasoning} {format_completion(px, pz)}"
-                record = {
-                    "prompt": prompt,
-                    "completion": completion,
-                    "level": level_name,
-                    "distance": cache["level"].distance,
-                    "rounds": cache["level"].rounds,
-                    "p": cache["level"].p,
-                    "num_data_qubits": int(layout.num_data_qubits),
-                    "num_x_stabilizers": int(cache["n_x_stab"]),
-                    "num_z_stabilizers": int(cache["n_z_stab"]),
-                    "syndrome_bits": [int(b) for b in det_row.tolist()],
-                    "true_x_errors": list(map(int, px)),
-                    "true_z_errors": list(map(int, pz)),
-                    "actual_observable_flip": actual_obs,
-                    "pymatching_observable_pred": pm_obs,
-                    "had_syndrome": bool(det_row.any()),
-                    "had_errors": bool(px or pz),
-                }
-                f.write(json.dumps(record) + "\n")
-                written += 1
-                if record["had_errors"]:
-                    n_with_errors += 1
-                    level_nonempty += 1
-                else:
-                    level_empty += 1
-                if record["had_syndrome"]:
-                    n_with_syndrome += 1
-
-            print(f"  [{level_name}] {level_nonempty} non-empty + "
-                  f"{level_empty} empty (drew {shots_drawn} shots, "
-                  f"natural non-empty rate "
-                  f"~{level_nonempty / max(1, shots_drawn):.1%})")
-
-    return written, n_with_syndrome, n_with_errors
+    return len(records), n_with_syndrome, n_with_errors
 
 
 def main(argv: Iterable[str] = ()) -> int:

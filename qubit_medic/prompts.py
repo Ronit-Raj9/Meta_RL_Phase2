@@ -44,13 +44,13 @@ Z-stabilizer count per round: {num_z_stabilizers}
 
 Identify which data qubits (numbered 0-{max_qubit_id}) had X-errors and Z-errors. Most syndromes have 0-2 errors; an empty list means no errors of that type.
 
-Reason briefly (1-2 sentences), then output your answer on the LAST line in this EXACT format:
+Output exactly ONE line and nothing else. Do not write reasoning, markdown, bullets, analysis, or explanations. Your entire response must match this exact format:
 X_ERRORS=[qubit_ids] Z_ERRORS=[qubit_ids]
 
-Examples:
-- No errors: X_ERRORS=[] Z_ERRORS=[]
-- One Z error on qubit 4: X_ERRORS=[] Z_ERRORS=[4]
-- Two errors: X_ERRORS=[2] Z_ERRORS=[5,6]"""
+Valid one-line examples:
+X_ERRORS=[] Z_ERRORS=[]
+X_ERRORS=[] Z_ERRORS=[4]
+X_ERRORS=[2] Z_ERRORS=[5,6]"""
 
 
 def format_syndrome_block(

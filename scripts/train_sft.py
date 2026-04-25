@@ -81,8 +81,8 @@ from typing import Iterable, Optional
 # SystemExit(2) so the Colab/Lightning shell pipeline exits with a non-zero
 # status and won't proceed to model loading.
 
-_BARE_FORMAT_LITERAL = "X_ERRORS=[] Z_ERRORS=[]"
 _FORMAT_ANCHOR_RE = re.compile(r"X_ERRORS=\[[\d,\s]*\]\s*Z_ERRORS=\[[\d,\s]*\]\s*$")
+_FORMAT_ONLY_RE = re.compile(r"^\s*X_ERRORS=\[[\d,\s]*\]\s*Z_ERRORS=\[[\d,\s]*\]\s*$")
 _TAIL_RE = re.compile(r"X_ERRORS=\[([^\]]*)\]\s*Z_ERRORS=\[([^\]]*)\]\s*$")
 _LEVEL_P_RE = re.compile(r"Physical error rate:\s*([\d.]+)")
 _LEVEL_D_RE = re.compile(r"Code distance:\s*(\d+)")
@@ -182,7 +182,7 @@ def _audit_file(path: Path) -> dict:
         levels[_level_label_from_record(r)] += 1
     plens = [len(r["prompt"]) for r in rows]
     clens = [len(r["completion"]) for r in rows]
-    bare = sum(1 for r in rows if r["completion"].strip() == _BARE_FORMAT_LITERAL)
+    format_only = sum(1 for r in rows if _FORMAT_ONLY_RE.fullmatch(r["completion"].strip()))
     return {
         "n": n,
         "parse_failures": parse_failures,
@@ -192,7 +192,7 @@ def _audit_file(path: Path) -> dict:
         "level_pct": {k: ((v / n) if n else 0.0) for k, v in levels.items()},
         "plens": plens,
         "clens": clens,
-        "bare_frac": (bare / n) if n else 0.0,
+        "format_only_frac": (format_only / n) if n else 0.0,
     }
 
 
@@ -213,8 +213,8 @@ def audit_sft_dataset(
         Format anchor:        100%
         Curriculum L1/L2/L3:  35-45% / 45-55% / 7-15%
         Prompt length:        min>=800, median in [1100,1600], max<=2200
-        Completion length:    min>=25, median in [80,250], max<=600
-        Bare-format-only:     <=10%
+        Completion length:    min>=22, median in [22,80], max<=120
+        Format-only target:   100%
         Validation parallel:  same thresholds applied to val split
     """
     EXPECTED_TRAIN = 3000
@@ -227,14 +227,11 @@ def audit_sft_dataset(
     L2_LO, L2_HI = 0.48, 0.52
     L3_LO, L3_HI = 0.08, 0.12
     PLEN_MIN, PLEN_MED_LO, PLEN_MED_HI, PLEN_MAX = 800, 1100, 1600, 2200
-    # CLEN_MED_LO loosened from 80 to 70: the dominant single-X / single-Z
-    # completion at d=3 with a single-digit qubit ID (e.g. "Z-stabilizer
-    # firings localize X-errors to qubit(s) 4. X_ERRORS=[4] Z_ERRORS=[]")
-    # is exactly 78 characters. At p=0.001 ~99% of non-trivial cases are
-    # single-error, which pulls the median to 78 -- structurally correct
-    # data that the previous 80-char floor would mis-flag.
-    CLEN_MIN, CLEN_MED_LO, CLEN_MED_HI, CLEN_MAX = 25, 70, 250, 600
-    BARE_MAX = 0.10
+    # Targets are deliberately one-line format strings. The earlier
+    # reasoning-prefix targets made the base model burn the full eval token
+    # budget on analysis and never reach the required parseable answer line.
+    CLEN_MIN, CLEN_MED_LO, CLEN_MED_HI, CLEN_MAX = 22, 22, 80, 120
+    FORMAT_ONLY_MIN = 1.0
 
     train = _audit_file(Path(train_path))
     if "error" in train:
@@ -300,9 +297,9 @@ def audit_sft_dataset(
     ))
 
     checks.append((
-        "Bare-format completions",
-        f"{train['bare_frac'] * 100:.1f}% (max 10%)",
-        train["bare_frac"] <= BARE_MAX,
+        "Format-only completions",
+        f"{train['format_only_frac'] * 100:.1f}% (target 100%)",
+        abs(train["format_only_frac"] - FORMAT_ONLY_MIN) < 1e-9,
     ))
 
     # ------------------------------- val parallel ------------------------- #
@@ -318,6 +315,7 @@ def audit_sft_dataset(
             and abs(val["parse_rate"] - 1.0) < 1e-9
             and NONEMPTY_LO <= val["nonempty_frac"] <= NONEMPTY_HI
             and abs(val["anchor_frac"] - 1.0) < 1e-9
+            and abs(val["format_only_frac"] - FORMAT_ONLY_MIN) < 1e-9
             and L1_LO <= v1 <= L1_HI
             and L2_LO <= v2 <= L2_HI
             and L3_LO <= v3 <= L3_HI
@@ -326,6 +324,7 @@ def audit_sft_dataset(
             f"rows={val['n']} parse={val['parse_rate']*100:.0f}% "
             f"nonempty={val['nonempty_frac']*100:.1f}% "
             f"anchor={val['anchor_frac']*100:.0f}% "
+            f"format_only={val['format_only_frac']*100:.0f}% "
             f"L1/L2/L3={v1*100:.1f}/{v2*100:.1f}/{v3*100:.1f}%"
         )
         checks.append(("Validation parallel", val_summary, val_pass))
@@ -739,6 +738,28 @@ def _build_validation_callback(
                          "format_ok", "format_strict_ok", "logical_ok",
                          "exact_match", "hamming_overlap"],
             )
+
+            # Fail fast on the known broken-SFT pattern: the model burns the
+            # whole generation budget on prose and never emits the format line.
+            # These thresholds mirror the runbook table in the issue analysis.
+            format_floor_by_step = {5: 0.10, 15: 0.30, 30: 0.60, 50: 0.80}
+            floor = format_floor_by_step.get(step)
+            if (
+                floor is not None
+                and not final
+                and metrics["eval/format_compliance"] < floor
+            ):
+                print(
+                    f"[sft] format guard tripped at step {step}: "
+                    f"format_compliance={metrics['eval/format_compliance']:.3f} "
+                    f"< {floor:.2f}. Stop and inspect raw outputs / data."
+                )
+                control.should_training_stop = True
+                wandb_utils.update_summary({
+                    "sft/early_stop_reason": "format_guard",
+                    "sft/format_guard_step": step,
+                    "sft/format_guard_floor": floor,
+                })
 
             # ---------- early stop checks ------------------------------ #
             # Only meaningful on full evals: logical_correction_rate and
