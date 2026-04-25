@@ -84,62 +84,14 @@ from typing import Iterable, Optional
 _BARE_FORMAT_LITERAL = "X_ERRORS=[] Z_ERRORS=[]"
 _FORMAT_ANCHOR_RE = re.compile(r"X_ERRORS=\[[\d,\s]*\]\s*Z_ERRORS=\[[\d,\s]*\]\s*$")
 _TAIL_RE = re.compile(r"X_ERRORS=\[([^\]]*)\]\s*Z_ERRORS=\[([^\]]*)\]\s*$")
-_LEVEL_P_RE = re.compile(r"Physical error rate:\s*([\d.]+)")
-_LEVEL_D_RE = re.compile(r"Code distance:\s*(\d+)")
 
-
-def _detect_level_from_prompt(prompt: str) -> str:
-    """Return ``"L1"``/``"L2"``/``"L3"``/``"unknown"`` for an SFT prompt.
-
-    Used as a fallback for legacy datasets that didn't write a ``level``
-    field into each record. We read the L1/L2/L3 ``p`` and ``distance``
-    values straight from :mod:`qubit_medic.config` rather than hardcoding
-    them, so the audit keeps working when the curriculum is tuned (e.g.
-    L1's ``p`` was bumped from 0.0001 -> 0.0005, which broke the old
-    hardcoded check and made every L1 row read as ``unknown``).
-    """
-    m_p = _LEVEL_P_RE.search(prompt)
-    m_d = _LEVEL_D_RE.search(prompt)
-    if not m_p or not m_d:
-        return "unknown"
-    p = float(m_p.group(1))
-    d = int(m_d.group(1))
-    try:
-        from qubit_medic.config import level_by_name
-        l3 = level_by_name("L3_stretch")
-        l2 = level_by_name("L2_target")
-        l1 = level_by_name("L1_warmup")
-        if d == l3.distance and abs(p - l3.p) < 1e-9:
-            return "L3"
-        if d == l2.distance and abs(p - l2.p) < 1e-9:
-            return "L2"
-        if d == l1.distance and abs(p - l1.p) < 1e-9:
-            return "L1"
-    except Exception:
-        pass
-    return "unknown"
-
-
-def _level_label_from_record(rec: dict) -> str:
-    """Return ``"L1"``/``"L2"``/``"L3"``/``"unknown"`` for an SFT record.
-
-    Prefers the explicit ``level`` field written by
-    ``scripts/generate_sft_data.py`` (e.g. ``"L1_warmup"``). Falls back
-    to :func:`_detect_level_from_prompt` for legacy records that lack
-    that field.
-    """
-    raw = rec.get("level")
-    if isinstance(raw, str):
-        if raw.startswith("L1"):
-            return "L1"
-        if raw.startswith("L2"):
-            return "L2"
-        if raw.startswith("L3"):
-            return "L3"
-    prompt = rec.get("prompt")
-    if isinstance(prompt, str):
-        return _detect_level_from_prompt(prompt)
-    return "unknown"
+# Map the generator's verbose level names (written on every record by
+# scripts/generate_sft_data.py) to the short tags used by the audit.
+_LEVEL_NORMALIZE: dict[str, str] = {
+    "L1_warmup": "L1",
+    "L2_target": "L2",
+    "L3_stretch": "L3",
+}
 
 
 def _has_nonempty_correction(completion: str) -> bool:
@@ -179,7 +131,7 @@ def _audit_file(path: Path) -> dict:
     anchor = sum(1 for r in rows if _FORMAT_ANCHOR_RE.search(r["completion"].rstrip()))
     levels = {"L1": 0, "L2": 0, "L3": 0, "unknown": 0}
     for r in rows:
-        levels[_level_label_from_record(r)] += 1
+        levels[_LEVEL_NORMALIZE.get(r.get("level"), "unknown")] += 1
     plens = [len(r["prompt"]) for r in rows]
     clens = [len(r["completion"]) for r in rows]
     bare = sum(1 for r in rows if r["completion"].strip() == _BARE_FORMAT_LITERAL)
@@ -209,7 +161,7 @@ def audit_sft_dataset(
     Locked thresholds:
         Total rows:           train=3000, val=100
         JSON parse rate:      100%
-        Non-empty correction: 65-75%
+        Non-empty correction: 55-75%
         Format anchor:        100%
         Curriculum L1/L2/L3:  35-45% / 45-55% / 7-15%
         Prompt length:        min>=800, median in [1100,1600], max<=2200
@@ -219,7 +171,9 @@ def audit_sft_dataset(
     """
     EXPECTED_TRAIN = 3000
     EXPECTED_VAL = 100
-    NONEMPTY_LO, NONEMPTY_HI = 0.65, 0.75
+    # Loosened from 0.65 to 0.55 to allow L1 to retain warmup character
+    # (30% non-empty floor) while preventing empty-class collapse.
+    NONEMPTY_LO, NONEMPTY_HI = 0.55, 0.75
     # Tightened to match quota-based per-level generation in
     # scripts/generate_sft_data.py, which produces the 40/50/10 split
     # exactly (no rejection-sampling drift).

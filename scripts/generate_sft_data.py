@@ -106,13 +106,14 @@ LEVEL_QUOTAS_VAL: dict[str, int] = {
 
 # Per-level minimum non-empty correction fraction. The math (with the
 # configured 40/50/10 quota mix) gives:
-#     L1 0.50 + L2 0.80 + L3 0.90 = 0.40*0.50 + 0.50*0.80 + 0.10*0.90 = 0.69
-# which lands solidly inside the audit's 65-75% target band. ``None``
+#     L1 0.30 + L2 0.80 + L3 0.90 = 0.40*0.30 + 0.50*0.80 + 0.10*0.90 = 0.61
+# which lands solidly inside the audit's 55-75% target band. ``None``
 # would mean "accept all draws naturally" but the natural non-empty rate
 # at L1's p=0.0005 (~3.5%) is too low to satisfy the audit, so we enforce
-# an explicit floor here too.
+# an explicit floor here too. L1 keeps a deliberately lower floor so the
+# warmup level retains a meaningful share of trivial "no error" cases.
 PER_LEVEL_NONEMPTY_FLOOR: dict[str, float | None] = {
-    "L1_warmup": 0.50,   # ~600 non-empty + 600 empty per 1200
+    "L1_warmup": 0.30,   # ~360 non-empty + 840 empty per 1200
     "L2_target": 0.80,   # ~1200 non-empty + 300 empty per 1500
     "L3_stretch": 0.90,  # ~270 non-empty + 30 empty per 300
 }
