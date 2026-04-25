@@ -20,6 +20,15 @@ pillow>=10
 # --- Test runner ---
 pytest>=8
 
+# --- OpenEnv (HuggingFace's RL-env framework). Required by the submission
+#     guidelines ("Use OpenEnv (latest release). Build on top of the
+#     framework; don't reinvent the wheel."). Our server wraps the
+#     DecoderEnvironment with `openenv.core.Environment`-compatible
+#     Action/Observation/State models so TRL can drive it via
+#     `environment_factory=` (see qubit_medic/server/openenv_adapter.py
+#     and scripts/train_grpo.py). Lightweight; safe in the Spaces image.
+openenv-core>=0.2.1
+
 # --- Training (omit on CPU-only deploy) ---
 # Heavy ML deps live in requirements-train.txt; the env server itself does
 # not import any of them. Keeping them out of the Docker image keeps the

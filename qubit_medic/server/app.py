@@ -1,109 +1,129 @@
-"""FastAPI app exposing the OpenEnv contract over HTTP.
+"""Qubit-Medic FastAPI server.
 
-Endpoints (Section 9 of the plan):
+Built on **openenv-core** ``create_fastapi_app`` so the canonical OpenEnv
+routes (``/reset``, ``/step``, ``/state``, ``/health``, ``/schema``,
+``/metadata``, ``/mcp``) are wired automatically by the framework.
 
-* ``POST /reset``   - start a new episode, returns a ``DecoderObservation``.
-* ``POST /step``    - submit the LLM's raw text, returns a ``StepResult``.
-* ``GET  /health``  - liveness + curriculum stats (used by HF Spaces).
-* ``POST /decode``  - convenience endpoint for live demo. Takes a syndrome
-  in the same wire format and returns the model's prediction. (The model
-  is loaded lazily; if no checkpoint is mounted the endpoint returns a
-  PyMatching baseline answer.)
+We add a few extras on top:
 
-Run with ``uvicorn qubit_medic.server.app:app --host 0.0.0.0 --port 7860``.
+* ``GET  /healthz``   - the Day-0 deployment-substrate liveness probe
+  (returns Stim/PyMatching/openenv versions). Used by the recurring
+  4-hour HF Spaces wakeup ping.
+* ``POST /decode``    - PyMatching baseline demo: takes a hand-crafted
+  syndrome and returns the matching-decoder's prediction. Useful for
+  the Gradio playground.
+
+Run with ``python -m qubit_medic.server.app`` or
+``uvicorn qubit_medic.server.app:app --host 0.0.0.0 --port 7860``.
 """
 from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Optional
 
-from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import Body, HTTPException
+from openenv.core import create_fastapi_app
 
 from qubit_medic.config import DEFAULT_HOST, DEFAULT_PORT
-from qubit_medic.models import (
-    DecoderAction,
-    DecoderObservation,
-    ResetRequest,
-    StepRequest,
-    StepResult,
-)
 from qubit_medic.server.environment import DecoderEnvironment
+from qubit_medic.server.openenv_adapter import (
+    QubitMedicAction,
+    QubitMedicEnvironment,
+    QubitMedicObservation,
+)
 
 
 logger = logging.getLogger("qubit_medic.server")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
-app = FastAPI(
-    title="Qubit-Medic OpenEnv",
-    description=(
-        "RL training environment for LLM-based quantum error-correction "
-        "decoders. Built on Stim + PyMatching with five independent "
-        "verifiable rewards (see /health for live curriculum stats)."
-    ),
-    version=os.getenv("QUBIT_MEDIC_VERSION", "1.0.0"),
+# --------------------------------------------------------------------------- #
+# Build the OpenEnv-compliant FastAPI app                                     #
+# --------------------------------------------------------------------------- #
+
+app = create_fastapi_app(
+    env=QubitMedicEnvironment,
+    action_cls=QubitMedicAction,
+    observation_cls=QubitMedicObservation,
+)
+app.title = "Qubit-Medic OpenEnv"
+app.version = os.getenv("QUBIT_MEDIC_VERSION", "1.0.0")
+app.description = (
+    "RL training environment for LLM-based quantum error-correction "
+    "decoders. Built on Stim + PyMatching with five independent verifiable "
+    "rewards (logical correction, syndrome consistency, Hamming overlap, "
+    "format compliance, PyMatching beat-rate). Wraps "
+    "qubit_medic.server.environment.DecoderEnvironment in "
+    "openenv.core.Environment - see /metadata, /schema, /docs."
 )
 
 
-_env: Optional[DecoderEnvironment] = None
-
-
-def get_env() -> DecoderEnvironment:
-    global _env
-    if _env is None:
-        _env = DecoderEnvironment()
-        # Pre-warm L1 + L2 caches so the first /reset doesn't pay compile cost.
-        _env._cache_for("L1_warmup")  # noqa: SLF001 - intentional pre-warm
-        _env._cache_for("L2_target")  # noqa: SLF001
-    return _env
-
-
 # --------------------------------------------------------------------------- #
-# OpenEnv contract                                                             #
+# Day-0 + demo extras                                                          #
 # --------------------------------------------------------------------------- #
 
+# Lazy-built *legacy* DecoderEnvironment for /decode demos. The OpenEnv
+# adapter has its own per-instance DecoderEnvironment; we keep this one
+# around for the simple synchronous `/decode` baseline endpoint.
+_legacy_env: Optional[DecoderEnvironment] = None
 
-@app.post("/reset", response_model=DecoderObservation)
-def reset(req: ResetRequest = Body(default=ResetRequest())) -> DecoderObservation:
-    """Start a new episode."""
-    return get_env().reset(seed=req.seed, forced_level=req.forced_level)
+
+def _get_legacy_env() -> DecoderEnvironment:
+    global _legacy_env
+    if _legacy_env is None:
+        _legacy_env = DecoderEnvironment()
+        _legacy_env._cache_for("L1_warmup")  # noqa: SLF001
+        _legacy_env._cache_for("L2_target")  # noqa: SLF001
+    return _legacy_env
 
 
-@app.post("/step", response_model=StepResult)
-def step(req: StepRequest) -> StepResult:
-    """Submit the LLM's raw response and get rewards back."""
+@app.get("/healthz")
+def healthz() -> dict:
+    """Lightweight liveness probe (Day-0 deployment-substrate test).
+
+    Returns the versions of Stim, PyMatching, and openenv so curl-ing
+    this in a browser or from Colab proves both that networking works
+    AND that the heavy quantum + RL deps actually loaded. Used by the
+    recurring 4-hour HF Spaces wakeup ping.
+    """
+    import stim
     try:
-        return get_env().step(raw_response=req.raw_response, episode_id=req.episode_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.get("/health")
-def health() -> dict:
-    """Liveness probe + curriculum stats. Used by HF Spaces."""
-    return get_env().health()
-
-
-# --------------------------------------------------------------------------- #
-# Demo endpoint - takes a raw syndrome, returns a prediction                   #
-# --------------------------------------------------------------------------- #
+        import pymatching as _pm
+        pm_v = getattr(_pm, "__version__", "unknown")
+    except Exception as exc:  # pragma: no cover - defensive
+        pm_v = f"import-error: {exc}"
+    try:
+        import openenv as _oe
+        oe_v = getattr(_oe, "__version__", "unknown")
+    except Exception as exc:  # pragma: no cover - defensive
+        oe_v = f"import-error: {exc}"
+    return {
+        "ok": True,
+        "service": "qubit-medic",
+        "version": app.version,
+        "stim_version": stim.__version__,
+        "pymatching_version": pm_v,
+        "openenv_version": oe_v,
+        "python_version": sys.version.split()[0],
+    }
 
 
 @app.post("/decode")
-def decode(syndrome: list[int] = Body(..., embed=True),
-           level: str = Body("L2_target", embed=True)) -> dict:
-    """Decode an arbitrary syndrome with PyMatching (baseline) and return its
-    predicted Pauli frame and observable flip.
+def decode(
+    syndrome: list[int] = Body(..., embed=True),
+    level: str = Body("L2_target", embed=True),
+) -> dict:
+    """Decode an arbitrary syndrome with PyMatching (baseline) and return
+    its predicted Pauli frame and observable flip.
 
-    This endpoint is intended for the live demo (Section 9.2): a Gradio app
-    can POST a hand-crafted syndrome here and visualise the result. When a
-    trained LLM checkpoint is mounted, replace the body with a call to the
-    LLM's predict function.
+    Intended for the live Gradio demo: a notebook or web page can POST a
+    hand-crafted syndrome here and visualise the matching-decoder result.
     """
     import numpy as np
-    env = get_env()
+
+    env = _get_legacy_env()
     cache = env._cache_for(level)  # noqa: SLF001
     arr = np.asarray(syndrome, dtype=np.uint8)
     if arr.shape[0] != cache.layout.num_detectors:
@@ -113,8 +133,8 @@ def decode(syndrome: list[int] = Body(..., embed=True),
                    f"{cache.layout.num_detectors} expected for {level}",
         )
     from qubit_medic.server.physics import (
-        pymatching_predicted_pauli_frame,
         predicted_observable_flip,
+        pymatching_predicted_pauli_frame,
     )
     pm_obs = int(cache.matching.decode(arr)[0])
     px, pz = pymatching_predicted_pauli_frame(cache.matching, arr, cache.layout)
@@ -124,7 +144,9 @@ def decode(syndrome: list[int] = Body(..., embed=True),
         "pymatching_observable_flip": pm_obs,
         "pymatching_x_errors": px,
         "pymatching_z_errors": pz,
-        "implied_observable_from_x_errors": predicted_observable_flip(px, cache.layout),
+        "implied_observable_from_x_errors": predicted_observable_flip(
+            px, cache.layout
+        ),
     }
 
 

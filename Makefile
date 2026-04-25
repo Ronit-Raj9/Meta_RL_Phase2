@@ -84,3 +84,24 @@ eval-baseline:
 	$(PY) -m scripts.eval --policy pymatching --episodes 500 \
 	    --report-to wandb --wandb-group $(GROUP) \
 	    --out data/baseline_eval.json
+
+# ---- HF Spaces deployment ----------------------------------------------- #
+# Set REPO=your-username/qubit-medic before running.
+
+REPO ?= ronitraj/QuantumScribe
+SPACE_URL ?= https://ronitraj-quantumscribe.hf.space
+
+deploy-placeholder:
+	$(PY) -m scripts.deploy_to_space --repo $(REPO) --placeholder
+
+deploy:
+	$(PY) -m scripts.deploy_to_space --repo $(REPO)
+
+hello-local:
+	$(PY) -m scripts.hello_space
+
+wakeup:
+	$(PY) -m scripts.wakeup_space --url $(SPACE_URL)
+
+healthz:
+	@curl -fsSL $(SPACE_URL)/healthz && echo

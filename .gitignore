@@ -34,3 +34,10 @@ runs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets - NEVER commit
+.env
+.env.*
+!.env.example
+*.token
+hf_token*

@@ -163,29 +163,62 @@ PRIMARY_SEED: int = SEEDS[0]
 # --------------------------------------------------------------------------- #
 
 MODEL_ID: str = "Qwen/Qwen2.5-3B-Instruct"
-"""3B params, 4-bit quantised + LoRA fits in a Colab T4."""
+"""Locked primary model. 3B params, 4-bit quantised + LoRA fits in a Colab T4.
+Backup is ``Qwen/Qwen2.5-7B-Instruct`` - only swap if format-test < 30%."""
 
+MODEL_BACKUP_ID: str = "Qwen/Qwen2.5-7B-Instruct"
+"""Only swap to this if the pre-onsite format test fails."""
+
+# ---- LoRA (shared SFT + GRPO) -------------------------------------------- #
 LORA_R: int = 16
-LORA_ALPHA: int = 32
+LORA_ALPHA: int = 32  # 2x rank, standard ratio
+LORA_DROPOUT: float = 0.05
 LORA_TARGET_MODULES: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
 
+# ---- SFT warmup phase (master spec, section 1) --------------------------- #
 SFT_EPOCHS: int = 1
 SFT_BATCH_SIZE: int = 4
-SFT_GRAD_ACCUM: int = 4
+SFT_GRAD_ACCUM: int = 4              # effective batch = 16
 SFT_LR: float = 2e-4
-SFT_DATASET_SIZE: int = 5_000
-SFT_MAX_SEQ_LEN: int = 2048
+SFT_LR_SCHEDULER: str = "constant_with_warmup"  # 20-step warmup then constant
+SFT_WARMUP_STEPS: int = 20
+SFT_WEIGHT_DECAY: float = 0.01
+SFT_OPTIMIZER: str = "adamw_8bit"
+SFT_DATASET_SIZE: int = 3_000        # 3,000 train + 100 held-out validation
+SFT_VAL_HOLDOUT: int = 100
+SFT_MAX_SEQ_LEN: int = 1024          # ~300 prompt + ~80 completion + headroom
+SFT_MAX_STEPS: int = 200             # hard cap; 3000/16=187.5 expected
+SFT_EVAL_EVERY: int = 50
+SFT_SAVE_EVERY: int = 50
+SFT_LOG_EVERY: int = 10
+SFT_MAX_NEW_TOKENS: int = 128        # generation cap during eval
 
+# Early-stop thresholds (master spec, section 3).
+SFT_EARLY_STOP_FORMAT: float = 0.95
+SFT_EARLY_STOP_CORRECTION: float = 0.80
+SFT_EARLY_STOP_DIVERSITY: int = 3
+SFT_MAX_WALL_SECONDS: float = 30 * 60.0  # 30-minute hard ceiling
+
+# ---- GRPO RL phase (master spec, section 5) ------------------------------ #
 GRPO_STEPS: int = 2_000
-GRPO_GEN_PER_PROMPT: int = 4
-GRPO_LR: float = 1e-5
-GRPO_KL_COEF: float = 0.04
-GRPO_MAX_PROMPT_LEN: int = 512
-GRPO_MAX_COMPLETION_LEN: int = 256
+GRPO_GEN_PER_PROMPT: int = 4         # GRPO needs >=2 for advantage
+GRPO_BATCH_SIZE: int = 1             # per-device prompts per step
+GRPO_GRAD_ACCUM: int = 8             # effective batch = 8 prompts
+GRPO_LR: float = 1e-5                # one order lower than SFT
+GRPO_LR_SCHEDULER: str = "constant"  # no warmup, no decay
+GRPO_KL_COEF: float = 0.04           # TRL default; alarm if KL > 0.3
+GRPO_MAX_PROMPT_LEN: int = 512       # prompts ~280 tokens
+GRPO_MAX_COMPLETION_LEN: int = 256   # reasoning + answer fits in ~80-150
+GRPO_TEMPERATURE: float = 0.7        # exploration without nonsense
+GRPO_TOP_P: float = 0.95             # nucleus sampling
 GRPO_CHECKPOINT_EVERY: int = 250
-GRPO_LOG_EVERY: int = 50
+GRPO_LOG_EVERY: int = 10             # real-time visibility
+GRPO_OPTIMIZER: str = "adamw_8bit"
+GRPO_KL_ALARM: float = 0.3           # >this triggers manual triage
+GRPO_KL_HARD_CEIL: float = 0.5       # >this -> kill the run
 
 # Decoding sampler defaults at evaluation/format-test time.
+# (Used by greedy eval paths: temp/top_p only matter when do_sample=True.)
 SAMPLE_TEMPERATURE: float = 0.7
 SAMPLE_TOP_P: float = 0.95
 
@@ -224,17 +257,21 @@ WANDB_DEFAULT_TAGS: tuple[str, ...] = (
 """Tags applied to every W&B run (per-script tags appended on top)."""
 
 WANDB_LOG_GENERATIONS_EVERY: int = 50
-"""Log a sample-completion table every N GRPO steps."""
+"""Log a sample-completion table every N GRPO steps (master spec sec. 7)."""
 
-WANDB_SAMPLE_GENERATIONS: int = 8
-"""Number of generations included in each sample-completion table."""
+WANDB_SAMPLE_GENERATIONS: int = 5
+"""Number of generations included in each sample-completion table.
+Master spec, section 7: 'Save 5 randomly sampled rollouts ... and their rewards.'"""
 
-WANDB_INLOOP_EVAL_EVERY: int = 200
+WANDB_INLOOP_EVAL_EVERY: int = 250
 """Run an in-loop evaluation pass (deterministic, ``WANDB_INLOOP_EVAL_EPISODES``
-syndromes) every N GRPO steps. Set to 0 to disable."""
+syndromes) every N GRPO steps. Master spec sec. 7: 'every 250 steps'."""
 
-WANDB_INLOOP_EVAL_EPISODES: int = 50
-"""Number of held-out syndromes per in-loop eval pass (kept small for speed)."""
+WANDB_INLOOP_EVAL_EPISODES: int = 100
+"""Held-out syndromes per in-loop eval pass (master spec: 100)."""
+
+WANDB_COMPARE_EVERY: int = 500
+"""Run the PyMatching head-to-head comparison every N steps (master spec sec. 7)."""
 
 
 # --------------------------------------------------------------------------- #

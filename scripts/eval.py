@@ -33,15 +33,41 @@ from qubit_medic.config import primary_level
 
 
 def _summary(name: str, results: list[dict]) -> dict:
+    """Aggregate per-episode reward dicts into the metrics the master spec
+    benchmarks against (sections 6 + 7 of the locked spec).
+
+    Each entry in ``results`` is the env's per-step ``info["rewards"]``
+    dict, optionally with extra fields the model-eval loop added
+    (``exact_match_pymatching``, ``output_length``).
+    """
     n = max(1, len(results))
     out = {
         "name": name,
         "episodes": len(results),
-        "format_compliance_rate": sum(r["format_compliance"] >= 0.5 for r in results) / n,
-        "logical_correction_rate": sum(r["logical_correction"] >= 0.5 for r in results) / n,
-        "mean_hamming_overlap": sum(r["hamming_overlap"] for r in results) / n,
-        "pymatching_beat_rate": sum(r["pymatching_beat"] >= 0.5 for r in results) / n,
-        "mean_total_reward": sum(r["total"] for r in results) / n,
+        # Headline metrics (master spec, section 6).
+        "logical_correction_rate":
+            sum(r["logical_correction"] >= 0.5 for r in results) / n,
+        "pymatching_beat_rate":
+            sum(r["pymatching_beat"] >= 0.5 for r in results) / n,
+        "format_compliance_rate":
+            sum(r["format_compliance"] >= 0.999 for r in results) / n,
+        "format_partial_rate":
+            sum((r["format_compliance"] >= 0.5
+                 and r["format_compliance"] < 0.999) for r in results) / n,
+        # Continuous progress metrics.
+        "syndrome_consistency_rate":
+            sum(r["syndrome_consistency"] >= 0.999 for r in results) / n,
+        "mean_syndrome_consistency":
+            sum(r["syndrome_consistency"] for r in results) / n,
+        "mean_hamming_overlap":
+            sum(r["hamming_overlap"] for r in results) / n,
+        "mean_total_reward":
+            sum(r["total"] for r in results) / n,
+        # Model-eval extras (present iff the model loop populated them).
+        "exact_match_pymatching":
+            sum(int(r.get("exact_match_pymatching", 0)) for r in results) / n,
+        "mean_output_length":
+            sum(int(r.get("output_length", 0)) for r in results) / n,
     }
     return out
 
@@ -89,7 +115,12 @@ def _eval_baseline(name: str, episodes: int, level: str,
 def _eval_model(adapter: str, episodes: int, level: str,
                 base_model: str, max_new_tokens: int,
                 collect_rows: bool = False):
-    """Use Unsloth to load the adapter and generate completions."""
+    """Use Unsloth to load the adapter and generate completions.
+
+    Populates ``exact_match_pymatching`` and ``output_length`` on each
+    per-episode reward dict so :func:`_summary` can report the master
+    spec's full benchmark suite (section 6 + section 7).
+    """
     from unsloth import FastLanguageModel
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=adapter if adapter else base_model,
@@ -110,15 +141,29 @@ def _eval_model(adapter: str, episodes: int, level: str,
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         out = model.generate(
             **inputs, max_new_tokens=max_new_tokens,
-            do_sample=False,  # deterministic eval
-            temperature=1.0, top_p=1.0,
+            do_sample=False,  # deterministic / greedy eval
             eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         )
-        completion = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:],
-                                      skip_special_tokens=True)
+        gen_ids = out[0][inputs["input_ids"].shape[1]:]
+        completion = tokenizer.decode(gen_ids, skip_special_tokens=True)
+        n_tokens = int(gen_ids.shape[0])
         result = client.step(raw_response=completion, episode_id=obs.episode_id)
-        rwd = result.info["rewards"]
+        rwd = dict(result.info["rewards"])  # copy so we can decorate
+
+        # Decorate with the master-spec extras.
+        action = result.info.get("parsed_action", {}) or {}
+        pm_x = sorted(set(map(int, result.info.get("pymatching_x_errors", []) or [])))
+        pm_z = sorted(set(map(int, result.info.get("pymatching_z_errors", []) or [])))
+        our_x = sorted(set(map(int, action.get("x_error_qubits", []) or [])))
+        our_z = sorted(set(map(int, action.get("z_error_qubits", []) or [])))
+        rwd["exact_match_pymatching"] = int(
+            bool(action.get("parse_success", False))
+            and our_x == pm_x and our_z == pm_z
+        )
+        rwd["output_length"] = n_tokens
         rewards.append(rwd)
+
         if collect_rows and ep < 50:
             rows.append({
                 "episode": ep,
@@ -128,6 +173,8 @@ def _eval_model(adapter: str, episodes: int, level: str,
                 "hamming_overlap": rwd["hamming_overlap"],
                 "format_compliance": rwd["format_compliance"],
                 "pymatching_beat": rwd["pymatching_beat"],
+                "exact_match_pymatching": rwd["exact_match_pymatching"],
+                "output_length": rwd["output_length"],
                 "total": rwd["total"],
                 "actual_obs_flip": result.info["actual_observable_flip"],
                 "pm_obs_flip": result.info["pymatching_observable_pred"],

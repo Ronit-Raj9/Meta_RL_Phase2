@@ -1,33 +1,58 @@
-"""scripts/train_sft.py - SFT warm-up phase (Section 6 of the plan).
+"""scripts/train_sft.py - SFT warm-up phase (master spec, sections 1-3).
 
-Loads Qwen2.5-3B-Instruct in 4-bit via Unsloth, attaches a LoRA adapter
-(rank 16, alpha 32, on q/k/v/o projections), and runs a single epoch of
-supervised fine-tuning on ``data/sft_dataset.jsonl``.
+Loads ``Qwen/Qwen2.5-3B-Instruct`` in 4-bit (NF4) via Unsloth, attaches a
+LoRA adapter (rank 16, alpha 32, dropout 0.05, on q/k/v/o projections),
+and runs a single epoch of supervised fine-tuning on
+``data/sft_dataset.jsonl`` (3,000 examples).
 
-Goal: take the base model from ~0% format compliance to ~95%+ so the GRPO
-trainer has a non-zero probability of getting a parseable reward.
+Goal: take the base model from ~0% format compliance to >=95% so the GRPO
+trainer has a non-zero probability of getting parseable rewards.
 
-Designed to run on a Colab T4 in ~30 minutes. The Stim/PyMatching server
-itself does *not* import any of these heavy ML deps - they live in
-``requirements-train.txt``.
+Locked hyperparameters (master spec, section 1):
+    * batch=4, grad_accum=4 -> effective batch 16
+    * lr=2e-4 with 20-step linear warmup -> constant
+    * weight_decay=0.01, optimizer=adamw_8bit, mixed precision=bf16
+    * max_seq_len=1024, epochs=1, max_steps=200
+    * checkpoint every 50, eval every 50, log every 10
+    * seed=42
 
-Run::
+Designed to run on a Colab T4 in <=30 minutes.
+
+Usage::
 
     pip install -r requirements-train.txt
     python -m scripts.train_sft \
         --dataset data/sft_dataset.jsonl \
+        --val-dataset data/sft_validation.jsonl \
         --output checkpoints/sft_warmup \
-        --report-to wandb \
-        --wandb-run-name my-sft-experiment
+        --report-to wandb
 
-W&B logging
------------
-* Every ``logging_steps`` steps: TRL's built-in train/loss curves.
-* Every ``--sample-every`` steps: a sample-completion ``wandb.Table``
-  showing prompt, model completion, parser X/Z output, and parse status.
-* End of training: a ``run.summary`` dict with final parse-success rate
-  and sample count. The LoRA adapter directory is uploaded as an
-  artifact so downstream GRPO runs can pull it by reference.
+W&B logging (master spec, section 2)
+------------------------------------
+* Every 10 steps: TRL's built-in train/loss, learning_rate, grad_norm,
+  epoch, global_step.
+* Every 50 steps (validation pass on 100 held-out syndromes):
+
+      eval/format_compliance
+      eval/logical_correction_rate
+      eval/exact_match_pymatching
+      eval/hamming_overlap_mean
+      eval/output_length_mean
+      eval/output_diversity         (10 samples of one prompt @ T=0.7)
+      eval/syndrome_consistency
+
+* End-of-train: ``run.summary`` dump of final eval scores; LoRA adapter
+  uploaded as a W&B artifact.
+
+Early stopping (master spec, section 3)
+---------------------------------------
+Training halts as soon as ANY of these is true after a validation pass:
+
+    1. format_compliance >= 0.95 AND logical_correction_rate >= 0.80
+       AND output_diversity >= 3                                (success)
+    2. global_step >= 200                                       (hard cap)
+    3. wall-clock >= 30 minutes                                 (hard cap)
+    4. train/loss has NaN or inf                                (failure)
 """
 from __future__ import annotations
 
@@ -36,131 +61,311 @@ import json
 import os
 import random
 import sys
+import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 
-def _load_dataset(path: str):
-    """Load the SFT JSONL into a HuggingFace Dataset."""
-    from datasets import Dataset
+# --------------------------------------------------------------------------- #
+# Validation-record loading                                                   #
+# --------------------------------------------------------------------------- #
 
-    rows = []
+
+def _load_jsonl(path: str) -> list[dict]:
+    rows: list[dict] = []
     with open(path) as f:
         for line in f:
-            rec = json.loads(line)
-            rows.append({
-                "prompt": rec["prompt"],
-                "completion": rec["completion"],
-                # Concatenate for SFTTrainer's "text" field with chat-style
-                # markers so the model learns "after this prompt, produce
-                # the formatted answer".
-                "text": (
-                    "<|im_start|>user\n"
-                    f"{rec['prompt']}\n<|im_end|>\n"
-                    "<|im_start|>assistant\n"
-                    f"{rec['completion']}<|im_end|>"
-                ),
-            })
-    return Dataset.from_list(rows)
+            rows.append(json.loads(line))
+    return rows
+
+
+def _load_train_dataset(path: str, tokenizer):
+    """Load the SFT JSONL into a HuggingFace Dataset.
+
+    Master spec (section 4): the chat template is applied via the
+    tokenizer (``apply_chat_template``), NOT by manually inserting
+    ``<|im_start|>`` markers - that way the same template works across
+    Qwen2.5 / Qwen3 / etc. without surprises.
+    """
+    from datasets import Dataset
+
+    rows = _load_jsonl(path)
+    out = []
+    for rec in rows:
+        messages = [
+            {"role": "user", "content": rec["prompt"]},
+            {"role": "assistant", "content": rec["completion"]},
+        ]
+        try:
+            text = tokenizer.apply_chat_template(messages, tokenize=False)
+        except Exception:
+            # Defensive fallback if apply_chat_template ever misbehaves.
+            text = (
+                "<|im_start|>user\n"
+                f"{rec['prompt']}\n<|im_end|>\n"
+                "<|im_start|>assistant\n"
+                f"{rec['completion']}<|im_end|>"
+            )
+        out.append({
+            "prompt": rec["prompt"],
+            "completion": rec["completion"],
+            "text": text,
+        })
+    return Dataset.from_list(out)
 
 
 # --------------------------------------------------------------------------- #
-# W&B sample-completion callback                                              #
+# Per-level physics caches (used by the validation callback)                  #
 # --------------------------------------------------------------------------- #
 
 
-def _build_wandb_callback(model, tokenizer, dataset, sample_every: int,
-                          n_samples: int, max_new_tokens: int):
-    """Return a ``TrainerCallback`` that logs a generation table to W&B.
+def _build_level_caches(needed_levels: set[str]) -> dict[str, dict]:
+    """Pre-build circuit / matching / layout / supports per curriculum level."""
+    import pymatching
 
-    Pulls ``n_samples`` random prompts from the held-out tail of the SFT
-    dataset and runs greedy decoding on them every ``sample_every`` steps.
-    The resulting ``wandb.Table`` columns are::
+    from qubit_medic.config import level_by_name
+    from qubit_medic.server.physics import (
+        build_circuit, build_dem, extract_layout, per_round_x_z_counts,
+    )
+    from qubit_medic.server.rewards import compute_final_detector_supports
 
-        step | prompt | gold_completion | model_completion |
-        x_pred | z_pred | parse_success | parse_partial
+    caches: dict[str, dict] = {}
+    for name in needed_levels:
+        lvl = level_by_name(name)
+        circuit = build_circuit(lvl)
+        dem = build_dem(circuit)
+        matching = pymatching.Matching.from_detector_error_model(dem)
+        layout = extract_layout(circuit)
+        n_x, n_z = per_round_x_z_counts(layout)
+        supports = compute_final_detector_supports(layout)
+        caches[name] = {
+            "level": lvl,
+            "circuit": circuit,
+            "dem": dem,
+            "matching": matching,
+            "layout": layout,
+            "supports": supports,
+            "num_x_stab": n_x,
+            "num_z_stab": n_z,
+        }
+    return caches
 
-    Plus a scalar ``train/sft_parse_success_rate`` so the rate appears on
-    the line plot too.
+
+# --------------------------------------------------------------------------- #
+# Validation callback (master spec, section 2 + section 3)                    #
+# --------------------------------------------------------------------------- #
+
+
+def _build_validation_callback(
+    *,
+    model,
+    tokenizer,
+    val_records: list[dict],
+    eval_every: int,
+    max_new_tokens: int,
+    diversity_n_samples: int,
+    diversity_temperature: float,
+    early_stop_format: float,
+    early_stop_correction: float,
+    early_stop_diversity: int,
+    max_wall_seconds: float,
+    started_wall: float,
+):
+    """Returns a ``TrainerCallback`` that:
+       * runs every ``eval_every`` steps,
+       * logs the seven spec metrics to W&B,
+       * stops training when the success criterion or the hard caps fire.
     """
     from transformers import TrainerCallback
 
     from qubit_medic import wandb_utils
     from qubit_medic.prompts import parse_action
+    from qubit_medic.server.physics import SyndromeSample
+    from qubit_medic.server.rewards import compute_all_rewards
 
-    if not wandb_utils.is_available():
+    if not val_records:
         return None
 
-    if len(dataset) < n_samples + 4:
-        eval_indices = list(range(len(dataset)))
-    else:
-        eval_indices = list(range(len(dataset) - n_samples, len(dataset)))
+    # Pre-build per-level physics for fast scoring.
+    needed = {r["level"] for r in val_records}
+    level_caches = _build_level_caches(needed)
 
-    class _SampleCallback(TrainerCallback):
+    # Pick one stable prompt for the diversity probe (always the same record
+    # so the diversity number is comparable across checkpoints).
+    diversity_record = val_records[0]
+    diversity_messages = [{"role": "user", "content": diversity_record["prompt"]}]
+
+    class _ValidationCallback(TrainerCallback):
+        # Stamp the most recent eval here so the on_train_end hook can avoid
+        # re-running if the eval step coincided with the final step.
+        last_eval_step: int = -1
+
         def on_step_end(self, args, state, control, **kwargs):  # noqa: D401
-            if state.global_step == 0 or state.global_step % sample_every != 0:
+            now = time.time() - started_wall
+            if now >= max_wall_seconds:
+                print(f"[sft] wall-clock cap {max_wall_seconds:.0f}s hit at step "
+                      f"{state.global_step}; stopping.")
+                control.should_training_stop = True
                 return
-            self._log(state.global_step)
+
+            if state.global_step == 0 or state.global_step % eval_every != 0:
+                return
+            self._run_eval(state, control)
 
         def on_train_end(self, args, state, control, **kwargs):  # noqa: D401
-            self._log(state.global_step, table_name="sft/final_generations")
+            if state.global_step != self.last_eval_step:
+                self._run_eval(state, control, final=True)
 
-        def _log(self, step: int, table_name: str = "sft/generations"):
+        # ------------------------------------------------------------------ #
+        # Core evaluation                                                    #
+        # ------------------------------------------------------------------ #
+        def _generate_greedy(self, messages: list[dict]) -> tuple[str, int]:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            inputs = tokenizer(text, return_tensors="pt").to(model.device)
+            try:
+                out = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                )
+                gen_ids = out[0][inputs["input_ids"].shape[1]:]
+                completion = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                return completion, int(gen_ids.shape[0])
+            except Exception as exc:
+                return f"<gen-error: {exc}>", 0
+
+        def _generate_sampled(self, messages: list[dict]) -> str:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            inputs = tokenizer(text, return_tensors="pt").to(model.device)
+            try:
+                out = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=diversity_temperature,
+                    top_p=0.95,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                )
+                return tokenizer.decode(
+                    out[0][inputs["input_ids"].shape[1]:],
+                    skip_special_tokens=True,
+                )
+            except Exception as exc:
+                return f"<gen-error: {exc}>"
+
+        def _run_eval(self, state, control, *, final: bool = False) -> None:
+            self.last_eval_step = state.global_step
             try:
                 from unsloth import FastLanguageModel
                 FastLanguageModel.for_inference(model)
             except Exception:
                 model.eval()  # type: ignore[attr-defined]
 
+            n = len(val_records)
+            n_format = n_logical = n_exact = 0
+            sum_hamming = 0.0
+            sum_syndrome = 0.0
+            sum_length = 0
             rows: list[dict] = []
-            n_success, n_partial = 0, 0
-            for idx in eval_indices:
-                rec = dataset[idx]
-                chat_in = (
-                    "<|im_start|>user\n"
-                    f"{rec['prompt']}\n<|im_end|>\n"
-                    "<|im_start|>assistant\n"
-                )
-                inputs = tokenizer(chat_in, return_tensors="pt").to(model.device)
-                try:
-                    out = model.generate(
-                        **inputs,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=False,
-                        eos_token_id=tokenizer.eos_token_id,
-                    )
-                    completion = tokenizer.decode(
-                        out[0][inputs["input_ids"].shape[1]:],
-                        skip_special_tokens=True,
-                    )
-                except Exception as exc:  # pragma: no cover
-                    completion = f"<gen-error: {exc}>"
-                num_data = 9  # primary distance-3 surface code
-                parsed = parse_action(completion, num_data_qubits=num_data)
-                n_success += int(parsed.parse_success)
-                n_partial += int(parsed.parse_partial and not parsed.parse_success)
-                rows.append({
-                    "step": step,
-                    "prompt": rec["prompt"][:600],
-                    "gold_completion": rec["completion"],
-                    "model_completion": completion[:300],
-                    "x_pred": ",".join(map(str, parsed.x_errors)),
-                    "z_pred": ",".join(map(str, parsed.z_errors)),
-                    "parse_success": parsed.parse_success,
-                    "parse_partial": parsed.parse_partial,
-                })
 
-            n = max(1, len(rows))
-            wandb_utils.log({
-                "sft/parse_success_rate": n_success / n,
-                "sft/parse_partial_rate": n_partial / n,
-                "sft/parse_failure_rate": (n - n_success - n_partial) / n,
-            }, step=step)
+            for idx, rec in enumerate(val_records):
+                cache = level_caches[rec["level"]]
+                layout = cache["layout"]
+                supports = cache["supports"]
+
+                messages = [{"role": "user", "content": rec["prompt"]}]
+                completion, n_tokens = self._generate_greedy(messages)
+                sum_length += n_tokens
+
+                num_data = int(rec["num_data_qubits"])
+                parsed = parse_action(completion, num_data_qubits=num_data)
+                sample = SyndromeSample(
+                    syndrome_bits=list(map(int, rec["syndrome_bits"])),
+                    actual_observable_flip=int(rec["actual_observable_flip"]),
+                    pymatching_observable_pred=int(rec["pymatching_observable_pred"]),
+                    pymatching_x_errors=list(map(int, rec["true_x_errors"])),
+                    pymatching_z_errors=list(map(int, rec["true_z_errors"])),
+                )
+                breakdown = compute_all_rewards(parsed, sample, layout, supports)
+
+                fmt_ok = parsed.parse_success
+                logical_ok = breakdown.logical_correction >= 0.5
+                exact_ok = (
+                    fmt_ok
+                    and parsed.x_errors == sorted(set(rec["true_x_errors"]))
+                    and parsed.z_errors == sorted(set(rec["true_z_errors"]))
+                )
+                n_format += int(fmt_ok)
+                n_logical += int(logical_ok)
+                n_exact += int(exact_ok)
+                sum_hamming += float(breakdown.hamming_overlap)
+                sum_syndrome += float(breakdown.syndrome_consistency)
+
+                if idx < 4:  # keep table tiny
+                    rows.append({
+                        "step": state.global_step,
+                        "prompt": rec["prompt"][:600],
+                        "gold": rec["completion"],
+                        "model": completion[:300],
+                        "x_pred": ",".join(map(str, parsed.x_errors)),
+                        "z_pred": ",".join(map(str, parsed.z_errors)),
+                        "format_ok": fmt_ok,
+                        "logical_ok": logical_ok,
+                        "exact_match": exact_ok,
+                        "hamming_overlap": breakdown.hamming_overlap,
+                    })
+
+            # ---------- diversity probe (one prompt, N samples, T=0.7) -- #
+            diverse_outputs: list[str] = []
+            for _ in range(diversity_n_samples):
+                diverse_outputs.append(self._generate_sampled(diversity_messages))
+            output_diversity = len(set(diverse_outputs))
+
+            # ---------- aggregate + log to W&B ------------------------- #
+            metrics = {
+                "eval/format_compliance": n_format / max(1, n),
+                "eval/logical_correction_rate": n_logical / max(1, n),
+                "eval/exact_match_pymatching": n_exact / max(1, n),
+                "eval/hamming_overlap_mean": sum_hamming / max(1, n),
+                "eval/syndrome_consistency": sum_syndrome / max(1, n),
+                "eval/output_length_mean": sum_length / max(1, n),
+                "eval/output_diversity": output_diversity,
+                "eval/episodes": n,
+            }
+            print(f"[sft][eval@{state.global_step}] " + ", ".join(
+                f"{k.split('/')[-1]}={v:.3f}" if isinstance(v, float) else f"{k.split('/')[-1]}={v}"
+                for k, v in metrics.items()
+            ))
+            wandb_utils.log(metrics, step=state.global_step)
             wandb_utils.log_generation_table(
-                rows, step=step, table_name=table_name,
-                columns=["step", "prompt", "gold_completion", "model_completion",
-                         "x_pred", "z_pred", "parse_success", "parse_partial"],
+                rows, step=state.global_step,
+                table_name=("sft/final_validation" if final else "sft/validation"),
+                columns=["step", "prompt", "gold", "model", "x_pred", "z_pred",
+                         "format_ok", "logical_ok", "exact_match", "hamming_overlap"],
             )
+
+            # ---------- early stop checks ------------------------------ #
+            success = (
+                metrics["eval/format_compliance"] >= early_stop_format
+                and metrics["eval/logical_correction_rate"] >= early_stop_correction
+                and metrics["eval/output_diversity"] >= early_stop_diversity
+            )
+            if success and not final:
+                print(f"[sft] success criterion hit at step {state.global_step}: "
+                      f"format={metrics['eval/format_compliance']:.3f} >= {early_stop_format}, "
+                      f"correction={metrics['eval/logical_correction_rate']:.3f} >= {early_stop_correction}, "
+                      f"diversity={int(metrics['eval/output_diversity'])} >= {early_stop_diversity}; "
+                      f"stopping.")
+                control.should_training_stop = True
+                wandb_utils.update_summary({"sft/early_stop_reason": "success_criterion"})
 
             try:
                 from unsloth import FastLanguageModel
@@ -168,7 +373,36 @@ def _build_wandb_callback(model, tokenizer, dataset, sample_every: int,
             except Exception:
                 model.train()  # type: ignore[attr-defined]
 
-    return _SampleCallback()
+    return _ValidationCallback()
+
+
+# --------------------------------------------------------------------------- #
+# Loss-divergence guard (failure mode early stop)                             #
+# --------------------------------------------------------------------------- #
+
+
+def _build_loss_guard_callback():
+    import math
+
+    from transformers import TrainerCallback
+
+    class _LossGuard(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):  # noqa: D401
+            if not logs:
+                return
+            loss = logs.get("loss")
+            if loss is None:
+                return
+            try:
+                lf = float(loss)
+            except (TypeError, ValueError):
+                return
+            if math.isnan(lf) or math.isinf(lf):
+                print(f"[sft] loss={loss} is NaN/inf at step {state.global_step}; "
+                      f"stopping training.")
+                control.should_training_stop = True
+
+    return _LossGuard()
 
 
 # --------------------------------------------------------------------------- #
@@ -179,34 +413,36 @@ def _build_wandb_callback(model, tokenizer, dataset, sample_every: int,
 def main(argv: Iterable[str] = ()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=str, default="data/sft_dataset.jsonl")
+    parser.add_argument("--val-dataset", type=str,
+                        default="data/sft_validation.jsonl",
+                        help="held-out validation JSONL (rich records). "
+                             "If missing, validation is skipped.")
     parser.add_argument("--output", type=str, default="checkpoints/sft_warmup")
     parser.add_argument("--model", type=str,
-                        default=os.getenv("QUBIT_MEDIC_MODEL", "Qwen/Qwen2.5-3B-Instruct"))
+                        default=os.getenv("QUBIT_MEDIC_MODEL",
+                                          "Qwen/Qwen2.5-3B-Instruct"))
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--grad-accum", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--max-seq-len", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="hard cap on training steps (default 200)")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--lora-r", type=int, default=None)
     parser.add_argument("--lora-alpha", type=int, default=None)
-    parser.add_argument("--report-to", type=str, default="wandb",
-                        help="`wandb`, `tensorboard`, `none`. Falls back to "
-                             "`none` if wandb is requested but unavailable.")
-    parser.add_argument("--wandb-run-name", type=str, default=None,
-                        help="W&B run name; auto-generated if omitted.")
-    parser.add_argument("--wandb-group", type=str, default=None,
-                        help="W&B group name to bundle SFT+GRPO+eval runs.")
-    parser.add_argument("--wandb-tags", type=str, nargs="*", default=("sft",),
-                        help="Extra W&B tags appended to the project defaults.")
-    parser.add_argument("--wandb-notes", type=str, default=None,
-                        help="Free-text notes pinned to the W&B run.")
-    parser.add_argument("--sample-every", type=int, default=100,
-                        help="Log a sample-completion table every N steps.")
-    parser.add_argument("--sample-count", type=int, default=4,
-                        help="Number of completions per sample-table snapshot.")
-    parser.add_argument("--no-artifact", action="store_true",
-                        help="Skip uploading the LoRA adapter dir as a W&B artifact.")
+    parser.add_argument("--lora-dropout", type=float, default=None)
+    parser.add_argument("--report-to", type=str, default="wandb")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument("--wandb-tags", type=str, nargs="*", default=("sft",))
+    parser.add_argument("--wandb-notes", type=str, default=None)
+    parser.add_argument("--eval-every", type=int, default=None,
+                        help="run validation pass every N steps (default 50)")
+    parser.add_argument("--diversity-samples", type=int, default=10,
+                        help="N samples for the output_diversity probe")
+    parser.add_argument("--diversity-temperature", type=float, default=0.7)
+    parser.add_argument("--no-artifact", action="store_true")
     args = parser.parse_args(list(argv))
 
     # Heavy imports are lazy so this module is importable without GPU deps.
@@ -222,8 +458,13 @@ def main(argv: Iterable[str] = ()) -> int:
 
     from qubit_medic import wandb_utils
     from qubit_medic.config import (
-        LORA_ALPHA, LORA_R, LORA_TARGET_MODULES, MODEL_ID, PRIMARY_SEED,
-        SFT_BATCH_SIZE, SFT_EPOCHS, SFT_GRAD_ACCUM, SFT_LR, SFT_MAX_SEQ_LEN,
+        LORA_ALPHA, LORA_DROPOUT, LORA_R, LORA_TARGET_MODULES, MODEL_ID,
+        PRIMARY_SEED, SFT_BATCH_SIZE, SFT_EARLY_STOP_CORRECTION,
+        SFT_EARLY_STOP_DIVERSITY, SFT_EARLY_STOP_FORMAT, SFT_EPOCHS,
+        SFT_EVAL_EVERY, SFT_GRAD_ACCUM, SFT_LOG_EVERY, SFT_LR,
+        SFT_LR_SCHEDULER, SFT_MAX_NEW_TOKENS, SFT_MAX_SEQ_LEN, SFT_MAX_STEPS,
+        SFT_MAX_WALL_SECONDS, SFT_OPTIMIZER, SFT_SAVE_EVERY, SFT_WARMUP_STEPS,
+        SFT_WEIGHT_DECAY,
     )
 
     epochs = args.epochs if args.epochs is not None else SFT_EPOCHS
@@ -231,9 +472,12 @@ def main(argv: Iterable[str] = ()) -> int:
     grad_accum = args.grad_accum if args.grad_accum is not None else SFT_GRAD_ACCUM
     lr = args.lr if args.lr is not None else SFT_LR
     max_seq_len = args.max_seq_len if args.max_seq_len is not None else SFT_MAX_SEQ_LEN
+    max_steps = args.max_steps if args.max_steps is not None else SFT_MAX_STEPS
     seed = args.seed if args.seed is not None else PRIMARY_SEED
     lora_r = args.lora_r if args.lora_r is not None else LORA_R
     lora_alpha = args.lora_alpha if args.lora_alpha is not None else LORA_ALPHA
+    lora_dropout = args.lora_dropout if args.lora_dropout is not None else LORA_DROPOUT
+    eval_every = args.eval_every if args.eval_every is not None else SFT_EVAL_EVERY
     model_id = args.model if args.model else MODEL_ID
 
     random.seed(seed)
@@ -255,20 +499,36 @@ def main(argv: Iterable[str] = ()) -> int:
                 "epochs": epochs,
                 "batch_size": batch_size,
                 "grad_accum": grad_accum,
+                "effective_batch": batch_size * grad_accum,
                 "lr": lr,
+                "lr_scheduler": SFT_LR_SCHEDULER,
+                "warmup_steps": SFT_WARMUP_STEPS,
+                "weight_decay": SFT_WEIGHT_DECAY,
+                "optimizer": SFT_OPTIMIZER,
                 "max_seq_len": max_seq_len,
+                "max_steps": max_steps,
                 "lora_r": lora_r,
                 "lora_alpha": lora_alpha,
+                "lora_dropout": lora_dropout,
+                "lora_target_modules": list(LORA_TARGET_MODULES),
                 "dataset_path": args.dataset,
+                "val_dataset_path": args.val_dataset,
                 "model": model_id,
                 "seed": seed,
                 "report_to": report_to,
+                "eval_every": eval_every,
+                "save_every": SFT_SAVE_EVERY,
+                "log_every": SFT_LOG_EVERY,
+                "early_stop_format": SFT_EARLY_STOP_FORMAT,
+                "early_stop_correction": SFT_EARLY_STOP_CORRECTION,
+                "early_stop_diversity": SFT_EARLY_STOP_DIVERSITY,
+                "max_wall_seconds": SFT_MAX_WALL_SECONDS,
             },
         },
     )
 
-    # ---- Load model + dataset ----------------------------------------- #
-    print(f"loading {model_id} via Unsloth (4-bit)")
+    # ---- Load model + datasets --------------------------------------- #
+    print(f"loading {model_id} via Unsloth (4-bit NF4)")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_id,
         max_seq_length=max_seq_len,
@@ -280,64 +540,95 @@ def main(argv: Iterable[str] = ()) -> int:
         r=lora_r,
         lora_alpha=lora_alpha,
         target_modules=list(LORA_TARGET_MODULES),
-        lora_dropout=0.0,
+        lora_dropout=lora_dropout,
         bias="none",
         use_gradient_checkpointing="unsloth",
         random_state=seed,
     )
 
-    print(f"loading dataset from {args.dataset}")
-    dataset = _load_dataset(args.dataset)
-    print(f"  {len(dataset)} samples; first text len = {len(dataset[0]['text'])}")
+    print(f"loading train dataset from {args.dataset}")
+    train_dataset = _load_train_dataset(args.dataset, tokenizer)
+    print(f"  {len(train_dataset)} samples; first text len = "
+          f"{len(train_dataset[0]['text'])}")
+
+    val_records: list[dict] = []
+    val_path = Path(args.val_dataset)
+    if val_path.exists():
+        val_records = _load_jsonl(args.val_dataset)
+        print(f"loaded {len(val_records)} held-out validation records "
+              f"from {args.val_dataset}")
+    else:
+        print(f"WARNING: no validation file at {args.val_dataset}; "
+              f"running without eval / early-stop.")
+
     wandb_utils.log({
-        "sft/dataset_size": len(dataset),
-        "sft/first_text_len": len(dataset[0]["text"]),
+        "sft/train_dataset_size": len(train_dataset),
+        "sft/val_dataset_size": len(val_records),
+        "sft/first_text_len": len(train_dataset[0]["text"]),
     })
+
+    # Dataset preview to W&B (sanity check the chat-template wrapping).
     wandb_utils.log_generation_table(
         [
-            {"split": "preview", "prompt": dataset[i]["prompt"][:600],
-             "completion": dataset[i]["completion"]}
-            for i in range(min(8, len(dataset)))
+            {"split": "train", "prompt": train_dataset[i]["prompt"][:600],
+             "completion": train_dataset[i]["completion"]}
+            for i in range(min(8, len(train_dataset)))
         ],
         step=0,
-        table_name="sft/dataset_preview",
+        table_name="sft/train_preview",
         columns=["split", "prompt", "completion"],
     )
 
-    # ---- TrainingArguments ------------------------------------------- #
+    # ---- TrainingArguments (locked spec) ----------------------------- #
     Path(args.output).mkdir(parents=True, exist_ok=True)
+    bf16_supported = (
+        torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    )
     training_args = TrainingArguments(
         output_dir=args.output,
         num_train_epochs=epochs,
+        max_steps=max_steps,             # hard cap; wins over epochs
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
         learning_rate=lr,
-        warmup_steps=50,
-        lr_scheduler_type="linear",
-        bf16=torch.cuda.is_available()
-            and torch.cuda.is_bf16_supported(),
-        fp16=torch.cuda.is_available()
-            and not torch.cuda.is_bf16_supported(),
-        logging_steps=10,
-        save_steps=200,
-        save_total_limit=2,
+        weight_decay=SFT_WEIGHT_DECAY,
+        warmup_steps=SFT_WARMUP_STEPS,
+        lr_scheduler_type=SFT_LR_SCHEDULER,
+        optim=SFT_OPTIMIZER,
+        bf16=bf16_supported,
+        fp16=torch.cuda.is_available() and not bf16_supported,
+        logging_steps=SFT_LOG_EVERY,
+        save_steps=SFT_SAVE_EVERY,
+        save_total_limit=4,
         seed=seed,
         report_to=report_to,
         run_name=run_name,
     )
 
-    callbacks = []
-    cb = _build_wandb_callback(model, tokenizer, dataset,
-                               sample_every=args.sample_every,
-                               n_samples=args.sample_count,
-                               max_new_tokens=160)
-    if cb is not None:
-        callbacks.append(cb)
+    # ---- Callbacks --------------------------------------------------- #
+    started_wall = time.time()
+    callbacks = [_build_loss_guard_callback()]
+    val_cb = _build_validation_callback(
+        model=model,
+        tokenizer=tokenizer,
+        val_records=val_records,
+        eval_every=eval_every,
+        max_new_tokens=SFT_MAX_NEW_TOKENS,
+        diversity_n_samples=args.diversity_samples,
+        diversity_temperature=args.diversity_temperature,
+        early_stop_format=SFT_EARLY_STOP_FORMAT,
+        early_stop_correction=SFT_EARLY_STOP_CORRECTION,
+        early_stop_diversity=SFT_EARLY_STOP_DIVERSITY,
+        max_wall_seconds=SFT_MAX_WALL_SECONDS,
+        started_wall=started_wall,
+    )
+    if val_cb is not None:
+        callbacks.append(val_cb)
 
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
         dataset_text_field="text",
         max_seq_length=max_seq_len,
         args=training_args,
@@ -345,18 +636,23 @@ def main(argv: Iterable[str] = ()) -> int:
         callbacks=callbacks,
     )
 
-    print("training...")
+    print(f"training (max_steps={max_steps}, eval_every={eval_every}) ...")
     train_result = trainer.train()
+    elapsed = time.time() - started_wall
     metrics = getattr(train_result, "metrics", {}) or {}
-    if metrics:
-        wandb_utils.update_summary({f"sft/final/{k}": v for k, v in metrics.items()
-                                    if isinstance(v, (int, float))})
+    wandb_utils.update_summary({
+        "sft/wall_seconds": elapsed,
+        **{f"sft/final/{k}": v for k, v in metrics.items()
+           if isinstance(v, (int, float))},
+    })
+    print(f"training finished in {elapsed:.1f}s "
+          f"(max_wall_seconds={SFT_MAX_WALL_SECONDS:.0f})")
 
     print(f"saving adapters to {args.output}")
     model.save_pretrained(args.output)
     tokenizer.save_pretrained(args.output)
 
-    # ---- Upload adapter as W&B artifact -------------------------------- #
+    # ---- Upload adapter as W&B artifact ------------------------------ #
     if not args.no_artifact:
         wandb_utils.log_artifact(
             args.output,

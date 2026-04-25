@@ -67,32 +67,81 @@ def test_http_health():
     with TestClient(app) as c:
         r = c.get("/health")
         assert r.status_code == 200
+        # OpenEnv's /health returns a HealthResponse with status + uptime.
+        body = r.json()
+        assert "status" in body or "ok" in body
+
+
+def test_http_healthz():
+    with TestClient(app) as c:
+        r = c.get("/healthz")
+        assert r.status_code == 200
         body = r.json()
         assert body["ok"] is True
+        assert "stim_version" in body
+        assert "openenv_version" in body
 
 
-def test_http_reset_and_step():
+def test_http_metadata_and_schema():
     with TestClient(app) as c:
-        r = c.post("/reset", json={"forced_level": "L1_warmup", "seed": 42})
-        assert r.status_code == 200
-        obs = r.json()
+        m = c.get("/metadata")
+        assert m.status_code == 200
+        assert m.json()["name"] == "QubitMedicEnvironment"
+        s = c.get("/schema")
+        assert s.status_code == 200
+        # Schema should expose action + observation models.
+        body = s.json()
+        assert isinstance(body, dict) and len(body) > 0
+
+
+def test_http_reset_and_step_openenv_shape():
+    """Drive the OpenEnv-canonical /reset + /step endpoints."""
+    with TestClient(app) as c:
+        # OpenEnv ResetRequest = {seed?, episode_id?}. Forced level rides
+        # along as a query-string param honoured by our adapter.
+        r = c.post("/reset", json={"seed": 42},
+                   params={"forced_level": "L1_warmup"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        obs = body.get("observation", body)
         assert obs["distance"] == 3
         ep = obs["episode_id"]
-        s = c.post("/step", json={"raw_response": "X_ERRORS=[] Z_ERRORS=[]",
-                                  "episode_id": ep})
-        assert s.status_code == 200
-        body = s.json()
-        assert body["done"] is True
+        # OpenEnv StepRequest wraps the action in {"action": {...}}.
+        s = c.post("/step", json={"action": {
+            "raw_response": "X_ERRORS=[] Z_ERRORS=[]",
+            "episode_id": ep,
+        }})
+        assert s.status_code == 200, s.text
+        sbody = s.json()
+        assert sbody["done"] is True
+        assert "reward" in sbody
+        sobs = sbody.get("observation", {})
+        assert "rewards" in sobs.get("info", {})
 
 
 def test_http_decode_endpoint():
+    """The legacy /decode demo endpoint stays mounted alongside OpenEnv."""
     with TestClient(app) as c:
-        r = c.post("/reset", json={"forced_level": "L1_warmup", "seed": 1})
-        n_dets = len(r.json()["syndrome_bits"])
+        # We need to know a syndrome length for a level. Easiest: ask the
+        # in-process env directly so we don't depend on /reset's shape.
+        local = LocalDecoderClient()
+        obs = local.reset(forced_level="L1_warmup", seed=1)
+        n_dets = len(obs.syndrome_bits)
         d = c.post("/decode",
                    json={"syndrome": [0] * n_dets, "level": "L1_warmup"})
-        assert d.status_code == 200
+        assert d.status_code == 200, d.text
         body = d.json()
         assert "pymatching_observable_flip" in body
         # All-zero syndrome -> PM predicts no flip.
         assert body["pymatching_observable_flip"] == 0
+
+
+def test_http_state_endpoint():
+    """OpenEnv's /state returns the QubitMedicState dump."""
+    with TestClient(app) as c:
+        c.post("/reset", json={"seed": 7})
+        r = c.get("/state")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert "step_count" in body
+        assert body["step_count"] >= 1

@@ -23,24 +23,43 @@ server:
   port: 7860
 
 endpoints:
+  # All endpoints below are registered automatically by
+  # openenv.core.create_fastapi_app via qubit_medic.server.app.
   reset:
     method: POST
     path: /reset
-    request_model: qubit_medic.models.ResetRequest
-    response_model: qubit_medic.models.DecoderObservation
+    request_model: openenv.core.types.ResetRequest
+    response_model: openenv.core.types.ResetResponse
   step:
     method: POST
     path: /step
-    request_model: qubit_medic.models.StepRequest
-    response_model: qubit_medic.models.StepResult
+    request_model: openenv.core.types.StepRequest
+    response_model: openenv.core.types.StepResponse
+  state:
+    method: GET
+    path: /state
+    response_model: qubit_medic.server.openenv_adapter.QubitMedicState
+  schema:
+    method: GET
+    path: /schema
+  metadata:
+    method: GET
+    path: /metadata
   health:
     method: GET
     path: /health
+  healthz:        # Day-0 deployment-substrate probe (extra)
+    method: GET
+    path: /healthz
+  decode:         # PyMatching baseline demo (extra)
+    method: POST
+    path: /decode
 
 models:
-  observation: qubit_medic.models.DecoderObservation
-  action: qubit_medic.models.DecoderAction
-  state: qubit_medic.models.DecoderState
+  environment: qubit_medic.server.openenv_adapter.QubitMedicEnvironment
+  action: qubit_medic.server.openenv_adapter.QubitMedicAction
+  observation: qubit_medic.server.openenv_adapter.QubitMedicObservation
+  state: qubit_medic.server.openenv_adapter.QubitMedicState
 
 rewards:
   - name: logical_correction

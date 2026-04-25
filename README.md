@@ -1,3 +1,24 @@
+---
+title: Qubit-Medic
+emoji: 🩺
+colorFrom: indigo
+colorTo: pink
+sdk: docker
+app_port: 7860
+pinned: true
+tags:
+  - openenv
+  - reinforcement-learning
+  - quantum-error-correction
+  - stim
+  - pymatching
+  - grpo
+  - trl
+  - llm
+license: mit
+short_description: OpenEnv RL env that teaches an LLM to decode quantum errors.
+---
+
 # Qubit-Medic
 
 > An LLM trained to decode quantum errors. We reproduce DeepMind's
@@ -19,9 +40,10 @@ baseline - but with TPU-scale compute and a custom architecture.
 
 We trained a **3B-parameter Qwen LLM** via SFT warm-up + GRPO RL on a
 **single T4** to do the same job. The training environment is built on
-Stim + PyMatching, exposes a clean OpenEnv-style HTTP contract, and scores
-generations with **five independent verifiable rewards** designed to be
-hard to game. The result is a David-vs-Goliath demonstration that the
+Stim + PyMatching, wraps `openenv.core.Environment` (so it speaks the
+official OpenEnv `/reset` / `/step` / `/state` / `/schema` / `/metadata`
+contract out of the box), and scores generations with **five independent
+verifiable rewards** designed to be hard to game. The result is a David-vs-Goliath demonstration that the
 AlphaQubit methodology generalises to commodity models and accessible
 compute.
 
@@ -39,11 +61,12 @@ compute.
 
 | | |
 |---|---|
-| Live env on HF Spaces | https://huggingface.co/spaces/qubit-medic/qubit-medic *(deploy after training)* |
+| Live env on HF Spaces | <https://huggingface.co/spaces/ronitraj/QuantumScribe>  ·  health check: [`/healthz`](https://ronitraj-quantumscribe.hf.space/healthz) |
 | Colab training notebook | [`notebooks/colab_train.ipynb`](notebooks/colab_train.ipynb) |
 | Demo (Gradio) | `python app_gradio.py` |
 | W&B run | *(populate after first GRPO run)* |
 | 2-minute video | *(populate after recording)* |
+| Mini-blog | *(populate after writing)* |
 
 ---
 

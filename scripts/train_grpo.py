@@ -1,15 +1,28 @@
-"""scripts/train_grpo.py - GRPO RL phase (Section 7 of the plan).
+"""scripts/train_grpo.py - GRPO RL phase (master spec, sections 5-7).
 
-Loads the SFT-warm-started model, connects to the OpenEnv server (local or
-remote via ``QUBIT_MEDIC_URL``), and runs TRL's :class:`GRPOTrainer` for
-2,000 steps with five reward functions registered separately.
+Loads the SFT-warm-started model, connects to the OpenEnv server (local
+or remote via ``QUBIT_MEDIC_URL``), and runs TRL's :class:`GRPOTrainer`
+for 2,000 steps with five reward functions registered separately.
 
-Each reward is a Python callable that maps ``(prompts, completions)`` to a
-list of floats; TRL aggregates them internally and logs each as its own
-column. We keep the weights in :mod:`qubit_medic.config` and apply them
-ourselves so the per-component lines on the W&B chart are interpretable.
+Each reward is a Python callable that maps ``(prompts, completions)``
+to a list of floats; TRL aggregates them internally and logs each as
+its own column. We keep the weights in :mod:`qubit_medic.config` and
+apply them ourselves so the per-component lines on the W&B chart stay
+interpretable.
 
-Run::
+Locked hyperparameters (master spec, section 5):
+    * 4 generations per prompt, temperature=0.7, top_p=0.95
+    * max_prompt_length=512, max_completion_length=256
+    * lr=1e-5 with constant scheduler (no warmup, no decay)
+    * KL coefficient beta=0.04
+    * per-device batch=1, grad_accum=8 -> effective batch 8 prompts
+    * 2,000 steps, bf16, optim=adamw_8bit, seed=42
+    * checkpoint every 250 steps, log every 10 steps
+    * generation logging every 50 steps (5 samples)
+    * eval every 250 steps (100 held-out syndromes)
+    * benchmark comparison every 500 steps
+
+Usage::
 
     python -m scripts.train_grpo \
         --sft-checkpoint checkpoints/sft_warmup \
@@ -17,23 +30,42 @@ Run::
         --steps 2000 \
         --report-to wandb
 
-W&B logging
------------
+W&B logging (master spec, section 7)
+------------------------------------
 On every GRPO step:
 
 * ``rl/reward/<component>_mean|std|min|max`` for all 5 components and total
 * ``rl/parse/{success,partial,failure}_rate``
 * ``rl/curriculum/<level>_mean`` and ``..._samples``
 * ``rl/env/{episodes_started,active_episodes,timeout_rate}``
+* ``rl/kl_alarm`` flag if KL crosses GRPO_KL_ALARM
 
-Every :data:`qubit_medic.config.WANDB_LOG_GENERATIONS_EVERY` steps a
-generation table is uploaded with prompt, completion, parse status, and
-each reward component.
+Every :data:`qubit_medic.config.WANDB_LOG_GENERATIONS_EVERY` (=50) steps a
+sample-completion table is uploaded with prompt, completion, parse status,
+and each reward component.
 
-Every :data:`qubit_medic.config.WANDB_INLOOP_EVAL_EVERY` steps a small
-held-out greedy eval pass logs ``eval/*`` scalars so the GRPO curve and
-the actual eval curve are visible side-by-side. The trained LoRA adapter
-directory is uploaded as a W&B artifact at the end of training.
+Every :data:`qubit_medic.config.WANDB_INLOOP_EVAL_EVERY` (=250) steps a
+held-out greedy eval pass logs the spec metrics::
+
+    eval/logical_correction_rate
+    eval/pymatching_beat_rate
+    eval/format_compliance
+    eval/syndrome_consistency_rate
+    eval/hamming_overlap_mean
+    eval/exact_match_pymatching       (good if this *decreases*)
+    eval/output_length_mean
+    eval/mean_total_reward
+
+Every :data:`qubit_medic.config.WANDB_COMPARE_EVERY` (=500) steps a
+PyMatching head-to-head comparison logs::
+
+    compare/our_vs_pymatching_diff
+    compare/syndromes_we_solved_pymatching_didnt
+    compare/syndromes_pymatching_solved_we_didnt
+    compare/agreement_rate
+
+The final LoRA adapter directory is uploaded as a W&B artifact at the
+end of training.
 """
 from __future__ import annotations
 
@@ -174,8 +206,14 @@ def _make_reward_fns(cache: _BatchScoringCache):
 def _build_wandb_callback(cache, model, tokenizer, env_client,
                           *, sample_every: int, sample_n: int,
                           inloop_every: int, inloop_episodes: int,
-                          inloop_max_new_tokens: int):
-    """Returns a TrainerCallback that drains ``cache`` after each step."""
+                          inloop_max_new_tokens: int,
+                          compare_every: int,
+                          kl_alarm: float):
+    """Returns a TrainerCallback that drains ``cache`` after each step.
+
+    Also runs every-250-steps held-out greedy eval and every-500-steps
+    PyMatching head-to-head comparison (master spec, section 7).
+    """
     from transformers import TrainerCallback
 
     from qubit_medic import wandb_utils
@@ -268,6 +306,25 @@ def _build_wandb_callback(cache, model, tokenizer, env_client,
             if inloop_every and step > 0 and step % inloop_every == 0:
                 self._run_inloop_eval(step)
 
+        def on_log(self, args, state, control, logs=None, **kwargs):  # noqa: D401
+            # KL alarm (master spec, section 7 + section 5 anti-hacking).
+            if not logs:
+                return
+            kl = logs.get("kl") or logs.get("train/kl_divergence")
+            if kl is None:
+                return
+            try:
+                kl_v = float(kl)
+            except (TypeError, ValueError):
+                return
+            if kl_v > kl_alarm:
+                wandb_utils.log({
+                    "rl/kl_alarm": 1.0,
+                    "rl/kl_alarm_value": kl_v,
+                }, step=state.global_step)
+                print(f"[grpo][step {state.global_step}] KL ALARM: {kl_v:.3f} "
+                      f"> {kl_alarm:.3f} - inspect generations.")
+
         def on_train_end(self, args, state, control, **kwargs):  # noqa: D401
             self._run_inloop_eval(state.global_step, table_name="rl/final_eval")
 
@@ -278,14 +335,25 @@ def _build_wandb_callback(cache, model, tokenizer, env_client,
             except Exception:
                 model.eval()  # type: ignore[attr-defined]
 
+            from qubit_medic.prompts import parse_action  # cheap re-import
+
             stats = {
                 "logical_correction": 0,
                 "format_success": 0,
                 "format_partial": 0,
                 "pymatching_beat": 0,
+                "syndrome_consistency_pass": 0,
+                "exact_match_pymatching": 0,
                 "total_reward_sum": 0.0,
+                "hamming_sum": 0.0,
+                "completion_len_sum": 0,
             }
+            # PyMatching head-to-head bookkeeping (master spec, section 7).
+            we_solved_pm_didnt = 0
+            pm_solved_we_didnt = 0
+            agree_count = 0
             rows = []
+
             for ep in range(inloop_episodes):
                 obs = env_client.reset()
                 chat = [{"role": "user", "content": obs.prompt}]
@@ -294,7 +362,8 @@ def _build_wandb_callback(cache, model, tokenizer, env_client,
                         chat, tokenize=False, add_generation_prompt=True,
                     )
                 except Exception:
-                    text = "<|im_start|>user\n" + obs.prompt + "\n<|im_end|>\n<|im_start|>assistant\n"
+                    text = ("<|im_start|>user\n" + obs.prompt
+                            + "\n<|im_end|>\n<|im_start|>assistant\n")
                 inputs = tokenizer(text, return_tensors="pt").to(model.device)
                 try:
                     out = model.generate(
@@ -302,45 +371,113 @@ def _build_wandb_callback(cache, model, tokenizer, env_client,
                         max_new_tokens=inloop_max_new_tokens,
                         do_sample=False,
                         eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
                     )
-                    completion = tokenizer.decode(
-                        out[0][inputs["input_ids"].shape[1]:],
-                        skip_special_tokens=True,
-                    )
+                    gen_ids = out[0][inputs["input_ids"].shape[1]:]
+                    completion = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                    n_tokens = int(gen_ids.shape[0])
                 except Exception as exc:  # pragma: no cover
                     completion = f"<gen-error: {exc}>"
+                    n_tokens = 0
                 result = env_client.step(raw_response=completion,
                                          episode_id=obs.episode_id)
                 rwd = result.info["rewards"]
                 action = result.info.get("parsed_action", {})
-                stats["logical_correction"] += int(rwd["logical_correction"] >= 0.5)
+                actual = int(result.info.get("actual_observable_flip", 0))
+                pm_pred = int(result.info.get("pymatching_observable_pred", 0))
+                we_correct = rwd["logical_correction"] >= 0.5
+                pm_correct = (pm_pred == actual)
+
+                stats["logical_correction"] += int(we_correct)
                 stats["format_success"] += int(action.get("parse_success", False))
-                stats["format_partial"] += int(rwd["format_compliance"] >= 0.5
-                                               and not action.get("parse_success", False))
+                stats["format_partial"] += int(
+                    rwd["format_compliance"] >= 0.5
+                    and not action.get("parse_success", False)
+                )
                 stats["pymatching_beat"] += int(rwd["pymatching_beat"] >= 0.5)
+                stats["syndrome_consistency_pass"] += int(
+                    rwd["syndrome_consistency"] >= 0.999
+                )
+                stats["hamming_sum"] += float(rwd["hamming_overlap"])
                 stats["total_reward_sum"] += float(rwd["total"])
-                if ep < 4:  # keep tables tiny
+                stats["completion_len_sum"] += n_tokens
+
+                # exact_match_pymatching: parsed prediction matches PM's
+                # canonical Pauli frame for THIS syndrome.
+                pm_x = sorted(set(map(int,
+                    result.info.get("pymatching_x_errors", []) or [])))
+                pm_z = sorted(set(map(int,
+                    result.info.get("pymatching_z_errors", []) or [])))
+                our_x = sorted(set(map(int,
+                    action.get("x_error_qubits", []) or [])))
+                our_z = sorted(set(map(int,
+                    action.get("z_error_qubits", []) or [])))
+                if action.get("parse_success", False) and pm_x == our_x and pm_z == our_z:
+                    stats["exact_match_pymatching"] += 1
+
+                # Comparison bookkeeping.
+                if we_correct and not pm_correct:
+                    we_solved_pm_didnt += 1
+                if pm_correct and not we_correct:
+                    pm_solved_we_didnt += 1
+                if we_correct == pm_correct:
+                    agree_count += 1
+
+                if ep < 4:  # tiny table for eyeball QC
                     rows.append({
                         "step": step,
                         "episode": ep,
                         "completion": completion[:300],
                         "logical_correction": rwd["logical_correction"],
+                        "syndrome_consistency": rwd["syndrome_consistency"],
+                        "format_compliance": rwd["format_compliance"],
+                        "pymatching_beat": rwd["pymatching_beat"],
                         "total": rwd["total"],
                     })
 
             n = max(1, inloop_episodes)
-            wandb_utils.log({
+            eval_metrics = {
                 "eval/logical_correction_rate": stats["logical_correction"] / n,
-                "eval/format_success_rate": stats["format_success"] / n,
+                "eval/format_compliance": stats["format_success"] / n,
                 "eval/format_partial_rate": stats["format_partial"] / n,
                 "eval/pymatching_beat_rate": stats["pymatching_beat"] / n,
+                "eval/syndrome_consistency_rate":
+                    stats["syndrome_consistency_pass"] / n,
+                "eval/hamming_overlap_mean": stats["hamming_sum"] / n,
+                "eval/exact_match_pymatching": stats["exact_match_pymatching"] / n,
+                "eval/output_length_mean": stats["completion_len_sum"] / n,
                 "eval/mean_total_reward": stats["total_reward_sum"] / n,
                 "eval/episodes": n,
-            }, step=step)
+            }
+            print(f"[grpo][eval@{step}] " + ", ".join(
+                f"{k.split('/')[-1]}={v:.3f}" if isinstance(v, float)
+                else f"{k.split('/')[-1]}={v}" for k, v in eval_metrics.items()
+            ))
+            wandb_utils.log(eval_metrics, step=step)
             if rows:
                 wandb_utils.log_generation_table(
                     rows, step=step, table_name=table_name,
                 )
+
+            # ---- PyMatching head-to-head comparison ------------------- #
+            # Run alongside every eval that lands on a ``compare_every``
+            # boundary. This is the headline plot data (master spec, sec 7).
+            if compare_every and step > 0 and step % compare_every == 0:
+                # both_correct = (count of we_correct) - (count of we_only)
+                both_correct = stats["logical_correction"] - we_solved_pm_didnt
+                pm_correct_count = both_correct + pm_solved_we_didnt
+                pm_lcr = pm_correct_count / n
+                our_lcr = stats["logical_correction"] / n
+                wandb_utils.log({
+                    "compare/our_lcr": our_lcr,
+                    "compare/pymatching_lcr": pm_lcr,
+                    "compare/our_vs_pymatching_diff": our_lcr - pm_lcr,
+                    "compare/syndromes_we_solved_pymatching_didnt":
+                        we_solved_pm_didnt,
+                    "compare/syndromes_pymatching_solved_we_didnt":
+                        pm_solved_we_didnt,
+                    "compare/agreement_rate": agree_count / n,
+                }, step=step)
 
             try:
                 from unsloth import FastLanguageModel
@@ -403,6 +540,11 @@ def main(argv: Iterable[str] = ()) -> int:
                         help="Override config WANDB_INLOOP_EVAL_EVERY (0 to disable)")
     parser.add_argument("--inloop-eval-episodes", type=int, default=None,
                         help="Override config WANDB_INLOOP_EVAL_EPISODES")
+    parser.add_argument("--compare-every", type=int, default=None,
+                        help="Run PyMatching head-to-head comparison every N "
+                             "steps (default: WANDB_COMPARE_EVERY=500)")
+    parser.add_argument("--kl-alarm", type=float, default=None,
+                        help="KL divergence threshold for the alarm (default 0.3)")
     parser.add_argument("--no-artifact", action="store_true")
     args = parser.parse_args(list(argv))
 
@@ -420,11 +562,14 @@ def main(argv: Iterable[str] = ()) -> int:
     from qubit_medic import wandb_utils
     from qubit_medic.client.client import make_default_client
     from qubit_medic.config import (
-        GRPO_CHECKPOINT_EVERY, GRPO_GEN_PER_PROMPT, GRPO_KL_COEF, GRPO_LOG_EVERY,
-        GRPO_LR, GRPO_MAX_COMPLETION_LEN, GRPO_MAX_PROMPT_LEN, GRPO_STEPS,
-        LORA_ALPHA, LORA_R, LORA_TARGET_MODULES, MODEL_ID, PRIMARY_SEED,
-        WANDB_INLOOP_EVAL_EPISODES, WANDB_INLOOP_EVAL_EVERY,
-        WANDB_LOG_GENERATIONS_EVERY, WANDB_SAMPLE_GENERATIONS,
+        GRPO_BATCH_SIZE, GRPO_CHECKPOINT_EVERY, GRPO_GEN_PER_PROMPT,
+        GRPO_GRAD_ACCUM, GRPO_KL_ALARM, GRPO_KL_COEF, GRPO_LOG_EVERY, GRPO_LR,
+        GRPO_LR_SCHEDULER, GRPO_MAX_COMPLETION_LEN, GRPO_MAX_PROMPT_LEN,
+        GRPO_OPTIMIZER, GRPO_STEPS, GRPO_TEMPERATURE, GRPO_TOP_P,
+        LORA_ALPHA, LORA_DROPOUT, LORA_R, LORA_TARGET_MODULES, MODEL_ID,
+        PRIMARY_SEED, WANDB_COMPARE_EVERY, WANDB_INLOOP_EVAL_EPISODES,
+        WANDB_INLOOP_EVAL_EVERY, WANDB_LOG_GENERATIONS_EVERY,
+        WANDB_SAMPLE_GENERATIONS,
     )
 
     steps = args.steps if args.steps is not None else GRPO_STEPS
@@ -438,6 +583,8 @@ def main(argv: Iterable[str] = ()) -> int:
     sample_n = args.sample_n if args.sample_n is not None else WANDB_SAMPLE_GENERATIONS
     inloop_every = args.inloop_eval_every if args.inloop_eval_every is not None else WANDB_INLOOP_EVAL_EVERY
     inloop_episodes = args.inloop_eval_episodes if args.inloop_eval_episodes is not None else WANDB_INLOOP_EVAL_EPISODES
+    compare_every = args.compare_every if args.compare_every is not None else WANDB_COMPARE_EVERY
+    kl_alarm = args.kl_alarm if args.kl_alarm is not None else GRPO_KL_ALARM
 
     _seed_everything(seed)
 
@@ -468,6 +615,14 @@ def main(argv: Iterable[str] = ()) -> int:
                 "sample_n": sample_n,
                 "inloop_eval_every": inloop_every,
                 "inloop_eval_episodes": inloop_episodes,
+                "compare_every": compare_every,
+                "kl_alarm": kl_alarm,
+                "temperature": GRPO_TEMPERATURE,
+                "top_p": GRPO_TOP_P,
+                "lr_scheduler": GRPO_LR_SCHEDULER,
+                "optimizer": GRPO_OPTIMIZER,
+                "grad_accum": GRPO_GRAD_ACCUM,
+                "effective_batch": GRPO_BATCH_SIZE * GRPO_GRAD_ACCUM,
                 "sft_checkpoint": args.sft_checkpoint,
                 "model": args.model,
                 "seed": seed,
@@ -498,33 +653,51 @@ def main(argv: Iterable[str] = ()) -> int:
             r=LORA_R,
             lora_alpha=LORA_ALPHA,
             target_modules=list(LORA_TARGET_MODULES),
-            lora_dropout=0.0,
+            lora_dropout=LORA_DROPOUT,
             bias="none",
             use_gradient_checkpointing="unsloth",
             random_state=seed,
         )
 
-    # ---- TRL GRPOConfig ----------------------------------------------- #
+    # ---- TRL GRPOConfig (LOCKED master spec, section 5) -------------- #
     Path(args.output).mkdir(parents=True, exist_ok=True)
-    config = GRPOConfig(
-        output_dir=args.output,
-        max_steps=steps,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        num_generations=gen_per_prompt,
-        max_prompt_length=max_p,
-        max_completion_length=max_c,
-        learning_rate=lr,
-        beta=kl_coef,
-        logging_steps=GRPO_LOG_EVERY,
-        save_steps=GRPO_CHECKPOINT_EVERY,
-        save_total_limit=4,
-        seed=seed,
-        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
-        report_to=report_to,
-        run_name=run_name,
+    bf16_supported = (
+        torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     )
+    grpo_kwargs: dict = {
+        "output_dir": args.output,
+        "max_steps": steps,
+        "per_device_train_batch_size": GRPO_BATCH_SIZE,
+        "gradient_accumulation_steps": GRPO_GRAD_ACCUM,
+        "num_generations": gen_per_prompt,
+        "max_prompt_length": max_p,
+        "max_completion_length": max_c,
+        "learning_rate": lr,
+        "beta": kl_coef,
+        "lr_scheduler_type": GRPO_LR_SCHEDULER,
+        "optim": GRPO_OPTIMIZER,
+        "logging_steps": GRPO_LOG_EVERY,
+        "save_steps": GRPO_CHECKPOINT_EVERY,
+        "save_total_limit": 4,
+        "seed": seed,
+        "bf16": bf16_supported,
+        "fp16": torch.cuda.is_available() and not bf16_supported,
+        "report_to": report_to,
+        "run_name": run_name,
+        # Sampling controls (TRL >= 0.9 names; tolerated by GRPOConfig).
+        "temperature": GRPO_TEMPERATURE,
+        "top_p": GRPO_TOP_P,
+    }
+    try:
+        config = GRPOConfig(**grpo_kwargs)
+    except TypeError:
+        # Older TRL versions don't accept temperature/top_p in GRPOConfig;
+        # drop them and rely on the trainer's defaults.
+        for k in ("temperature", "top_p"):
+            grpo_kwargs.pop(k, None)
+        config = GRPOConfig(**grpo_kwargs)
+        print("WARNING: this TRL version does not accept temperature/top_p "
+              "in GRPOConfig; sampling defaults to TRL's built-ins.")
 
     # ---- Reward functions + scoring cache ----------------------------- #
     cache = _BatchScoringCache(env_client=env_client)
@@ -536,6 +709,8 @@ def main(argv: Iterable[str] = ()) -> int:
         sample_every=sample_every, sample_n=sample_n,
         inloop_every=inloop_every, inloop_episodes=inloop_episodes,
         inloop_max_new_tokens=max_c,
+        compare_every=compare_every,
+        kl_alarm=kl_alarm,
     )
     if cb is not None:
         callbacks.append(cb)
