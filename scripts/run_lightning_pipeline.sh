@@ -173,22 +173,62 @@ PY
     --index-url "${TORCH_INDEX_URL}" \
     "xformers==${XFORMERS_VERSION}"
 
-  echo "[lightning] (3/6) installing unsloth==${UNSLOTH_VERSION} + unsloth_zoo==${UNSLOTH_ZOO_VERSION} with --no-deps"
+  echo "[lightning] (3/6) installing unsloth==${UNSLOTH_VERSION} + unsloth_zoo==${UNSLOTH_ZOO_VERSION} with --no-deps --force-reinstall"
   echo "[lightning]      (this is the same trick the Unsloth Colab notebook uses, so unsloth"
   echo "[lightning]       cannot drag in a newer xformers / torch and undo step 1+2)"
   echo "[lightning]      (PINNED: latest unsloth 2026.4.x misparses Qwen2.5-3B config when paired"
   echo "[lightning]       with transformers<4.55, instantiating a 7B-shaped model and crashing"
   echo "[lightning]       on the embedding load with: shape [151936,2048] vs [151936,4096])"
-  python -m pip install --no-deps \
+  echo "[lightning]      (--force-reinstall guarantees the pin sticks even if Lightning's"
+  echo "[lightning]       cloudspace image already has a newer unsloth that pip would"
+  echo "[lightning]       otherwise mark as 'requirement already satisfied')"
+  python -m pip install --no-deps --force-reinstall \
     "unsloth==${UNSLOTH_VERSION}" \
     "unsloth_zoo==${UNSLOTH_ZOO_VERSION}"
 
-  echo "[lightning] (4/6) installing trl==${TRL_VERSION} + transformers==${TRANSFORMERS_VERSION}"
+  echo "[lightning] (4/6) installing trl==${TRL_VERSION} + transformers==${TRANSFORMERS_VERSION} (--force-reinstall)"
   echo "[lightning]      (trl>=0.21 imports FSDPModule from torch.distributed.fsdp,"
   echo "[lightning]       which only exists in torch>=2.6; we are on torch ${TORCH_VERSION})"
-  python -m pip install \
+  python -m pip install --force-reinstall \
     "trl==${TRL_VERSION}" \
     "transformers==${TRANSFORMERS_VERSION}"
+
+  # Hard gate: refuse to continue if any pin did not stick. Without this,
+  # a silent pip resolve (e.g. a sibling package re-pulling transformers
+  # 4.51.x as a dep) reaches train_sft.py and explodes with the embedding
+  # shape mismatch we are trying to prevent.
+  echo "[lightning] (4b/6) verifying pinned versions actually stuck"
+  python - "${UNSLOTH_VERSION}" "${UNSLOTH_ZOO_VERSION}" "${TRL_VERSION}" "${TRANSFORMERS_VERSION}" <<'PY'
+import sys
+expected_unsloth, expected_unsloth_zoo, expected_trl, expected_transformers = sys.argv[1:5]
+problems = []
+try:
+    import unsloth, unsloth_zoo, trl, transformers
+except Exception as exc:
+    sys.stderr.write(f"[lightning] FATAL: cannot import pinned stack: {exc}\n")
+    sys.exit(10)
+checks = [
+    ("unsloth", unsloth.__version__, expected_unsloth),
+    ("unsloth_zoo", unsloth_zoo.__version__, expected_unsloth_zoo),
+    ("trl", trl.__version__, expected_trl),
+    ("transformers", transformers.__version__, expected_transformers),
+]
+for name, got, want in checks:
+    marker = "OK" if got == want else "WRONG"
+    print(f"[lightning]   {name:14s} {got:12s}  (expected {want})  [{marker}]")
+    if got != want:
+        problems.append(f"{name}: got {got}, expected {want}")
+if problems:
+    sys.stderr.write(
+        "[lightning] FATAL: version pins did not stick:\n"
+        + "\n".join(f"  - {p}" for p in problems)
+        + "\n[lightning] This is the failure mode that produces the\n"
+          "[lightning]   'size mismatch ... [151936, 2048] vs [151936, 4096]'\n"
+          "[lightning] error during model load. Aborting BEFORE we waste\n"
+          "[lightning] GPU minutes downloading weights into a broken stack.\n"
+    )
+    sys.exit(11)
+PY
 
   echo "[lightning] (5/6) installing the rest of requirements-train.txt EXCEPT torch / xformers / unsloth / trl / transformers"
   # Strip torch* / xformers / unsloth* / trl / transformers lines before
@@ -206,8 +246,9 @@ PY
 fi
 
 echo "[lightning] verifying torch + unsloth before delegating to the colab pipeline"
-python - <<'PY'
+python - "${UNSLOTH_VERSION}" "${UNSLOTH_ZOO_VERSION}" "${TRL_VERSION}" "${TRANSFORMERS_VERSION}" "${TORCH_VERSION}" <<'PY'
 import sys
+expected_unsloth, expected_unsloth_zoo, expected_trl, expected_transformers, expected_torch = sys.argv[1:6]
 import torch
 print(f"[lightning] torch={torch.__version__}  cuda_available={torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -242,12 +283,42 @@ except Exception as exc:
     )
     sys.exit(4)
 try:
-    import unsloth
+    import unsloth, unsloth_zoo
     from unsloth import FastLanguageModel  # noqa: F401
-    print(f"[lightning] unsloth={unsloth.__version__} ok")
+    print(f"[lightning] unsloth={unsloth.__version__} unsloth_zoo={unsloth_zoo.__version__} ok")
 except Exception as exc:
     sys.stderr.write(f"[lightning] FATAL: unsloth import failed: {exc}\n")
     sys.exit(5)
+
+# Final pin assertion. By the time we reach here, steps 5+6 (the bulk
+# pip installs of requirements-train.txt and requirements.txt) have run
+# and could -- in theory -- have been re-resolved transformers / trl /
+# unsloth as a transitive dep. Re-verify so we never reach the SFT
+# trainer with the known-bad combination
+# (unsloth 2026.4.x + transformers <4.55) that produces the
+#   "size mismatch ... [151936, 2048] vs [151936, 4096]"
+# embedding load failure on Qwen2.5-3B.
+final_problems = []
+final_checks = [
+    ("torch", torch.__version__.split("+")[0], expected_torch),
+    ("unsloth", unsloth.__version__, expected_unsloth),
+    ("unsloth_zoo", unsloth_zoo.__version__, expected_unsloth_zoo),
+    ("trl", trl.__version__, expected_trl),
+    ("transformers", transformers.__version__, expected_transformers),
+]
+for name, got, want in final_checks:
+    if got != want:
+        final_problems.append(f"{name}: got {got}, expected {want}")
+if final_problems:
+    sys.stderr.write(
+        "[lightning] FATAL: a later pip step re-resolved a pinned package:\n"
+        + "\n".join(f"  - {p}" for p in final_problems)
+        + "\n[lightning] Refusing to delegate to the SFT trainer because\n"
+          "[lightning] the bad combination produces the embedding shape\n"
+          "[lightning] mismatch on Qwen2.5-3B model load.\n"
+    )
+    sys.exit(6)
+print("[lightning] all pins held through the full install -- safe to train.")
 PY
 
 # We just installed everything; tell the colab pipeline NOT to redo it

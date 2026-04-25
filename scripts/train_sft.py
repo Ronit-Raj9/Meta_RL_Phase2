@@ -959,8 +959,55 @@ def main(argv: Iterable[str] = ()) -> int:
         },
     )
 
+    # ---- Preflight: refuse to run with the known-bad Unsloth+TF combo  #
+    # (unsloth >= 2026.4.0) + (transformers < 4.55.0) silently misparses
+    # the Qwen2.5-3B config: it instantiates a 7B-shaped model
+    # (hidden=4096) and crashes when the 3B checkpoint (hidden=2048)
+    # starts loading, with:
+    #   RuntimeError: size mismatch for weight: copying a param with
+    #   shape torch.Size([151936, 2048]) from checkpoint, the shape in
+    #   current model is torch.Size([151936, 4096]).
+    # We catch this BEFORE downloading >5GB of weights so the user does
+    # not burn GPU minutes on a deterministic failure.
+    import unsloth as _unsloth
+    import transformers as _transformers
+
+    def _parse_ver(v: str) -> tuple[int, ...]:
+        out: list[int] = []
+        for part in v.split("+", 1)[0].split("."):
+            digits = "".join(ch for ch in part if ch.isdigit())
+            out.append(int(digits) if digits else 0)
+        return tuple(out)
+
+    _u = _parse_ver(_unsloth.__version__)
+    _t = _parse_ver(_transformers.__version__)
+    _is_qwen25_3b = "qwen2.5-3b" in model_id.lower()
+    _bad_combo = _u >= (2026, 4, 0) and _t < (4, 55, 0)
+    if _is_qwen25_3b and _bad_combo:
+        print(
+            "[train_sft] FATAL: detected the unsloth/transformers combo that\n"
+            f"           silently misparses {model_id} into a 7B-shaped model.\n"
+            f"           Installed: unsloth=={_unsloth.__version__}  "
+            f"transformers=={_transformers.__version__}\n"
+            "           This exact pair produces the\n"
+            "             'size mismatch ... [151936, 2048] vs [151936, 4096]'\n"
+            "           error during model load on Lightning AI / Colab.\n"
+            "           Fix: pin to a known-good combination, e.g.\n"
+            "             pip install --no-deps --force-reinstall \\\n"
+            "                 unsloth==2025.11.1 unsloth_zoo==2026.4.9\n"
+            "             pip install --force-reinstall \\\n"
+            "                 transformers==4.57.2 trl==0.20.0\n"
+            "           Or re-run scripts/run_lightning_pipeline.sh which\n"
+            "           pins these correctly and now hard-fails if the pins\n"
+            "           do not stick.",
+            file=sys.stderr,
+        )
+        return 1
+
     # ---- Load model + datasets --------------------------------------- #
     print(f"loading {model_id} via Unsloth (4-bit NF4)")
+    print(f"  unsloth={_unsloth.__version__}  "
+          f"transformers={_transformers.__version__}")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_id,
         max_seq_length=max_seq_len,
