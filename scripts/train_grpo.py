@@ -70,6 +70,7 @@ end of training.
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import random
 import sys
@@ -78,6 +79,108 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
+
+
+# --------------------------------------------------------------------------- #
+# Pre-flight: detect the unsloth / unsloth_zoo signature skew that crashes    #
+# GRPO at step 0 with a misleading TypeError.                                 #
+# --------------------------------------------------------------------------- #
+#
+# unsloth==2025.11.1's GRPO trainer template calls
+#     grpo_accumulated_loss(..., old_hidden_states=..., ref_hidden_states=...)
+# but unsloth_zoo>=2026.x renamed those positional args to old_logps / ref_logps
+# with no compat shim. Pip's resolver (with the unpinned `unsloth` line in
+# requirements-train.txt) silently couples the two: it picks
+#     unsloth==2025.11.1  +  unsloth_zoo==2026.4.9
+# and that pair crashes at the first training step with:
+#     TypeError: grpo_accumulated_loss() missing 2 required positional
+#     arguments: 'old_logps' and 'ref_logps'
+#
+# SFT does not exercise this code path, so SFT finishes cleanly first, the
+# checkpoint gets saved, and only then GRPO blows up - wasting the whole SFT
+# run. This guard runs in well under a second, before any GPU work, and
+# prints the exact pip command to fix it instead of the cryptic TypeError.
+# --------------------------------------------------------------------------- #
+
+
+def _assert_grpo_signature_compatible() -> None:
+    """Abort early if the installed unsloth_zoo signature does not match
+    the call pattern baked into the installed unsloth.
+    """
+    try:
+        import unsloth  # noqa: F401  (force the patches to apply first)
+        import unsloth_zoo
+        from unsloth_zoo.rl_replacements import grpo_accumulated_loss
+    except Exception as exc:
+        print(f"[grpo-guard] WARNING: could not introspect unsloth_zoo "
+              f"({exc!r}); skipping signature check.", file=sys.stderr)
+        return
+
+    params = list(inspect.signature(grpo_accumulated_loss).parameters.keys())
+    has_hidden = "old_hidden_states" in params and "ref_hidden_states" in params
+    has_logps = "old_logps" in params and "ref_logps" in params
+
+    # The unsloth in this repo is pinned to the 2025.11.x lineage (matches
+    # what SFT just used). That lineage calls with old_hidden_states= /
+    # ref_hidden_states=. If unsloth_zoo has those names, we are fine.
+    if has_hidden:
+        return
+
+    unsloth_ver = getattr(unsloth, "__version__", "?")
+    zoo_ver = getattr(unsloth_zoo, "__version__", "?")
+    have_logps_only = has_logps and not has_hidden
+
+    msg = [
+        "",
+        "=" * 78,
+        "[grpo-guard] FATAL: unsloth / unsloth_zoo signature mismatch detected.",
+        "=" * 78,
+        f"  unsloth     == {unsloth_ver}",
+        f"  unsloth_zoo == {zoo_ver}",
+        f"  grpo_accumulated_loss parameters: {params}",
+        "",
+        "  unsloth (this version) calls grpo_accumulated_loss with",
+        "    old_hidden_states=... , ref_hidden_states=...",
+        "  but the installed unsloth_zoo expects",
+        "    old_logps=... , ref_logps=...",
+        "  as required positional arguments." if have_logps_only else
+        "  but the installed unsloth_zoo signature does not contain those names.",
+        "",
+        "  Without this fix, GRPO will crash at step 0 with:",
+        "    TypeError: grpo_accumulated_loss() missing 2 required positional",
+        "    arguments: 'old_logps' and 'ref_logps'",
+        "",
+        "  Fix on Colab (one-liner):",
+        "    pip install --no-deps --force-reinstall unsloth_zoo==2025.11.1 \\",
+        "      && rm -rf unsloth_compiled_cache",
+        "",
+        "  Then re-run:",
+        "    python -m scripts.train_grpo --sft-checkpoint checkpoints/sft_warmup \\",
+        "        --output checkpoints/grpo_final",
+        "=" * 78,
+        "",
+    ]
+    raise SystemExit("\n".join(msg))
+
+
+def _wipe_stale_grpo_cache() -> None:
+    """Remove unsloth_compiled_cache/UnslothGRPOTrainer.py if present.
+
+    The cache file is regenerated automatically by unsloth on the next
+    GRPO import using the *currently installed* unsloth_zoo source, so
+    deleting it is safe and is the only way to recover after fixing
+    a previously-mismatched install (the cache itself can hold the
+    broken signature even once pip has been corrected).
+    """
+    cache_file = Path("unsloth_compiled_cache") / "UnslothGRPOTrainer.py"
+    if cache_file.exists():
+        print(f"[grpo-guard] removing stale {cache_file} so it regenerates "
+              f"against the current unsloth_zoo install")
+        try:
+            cache_file.unlink()
+        except OSError as exc:
+            print(f"[grpo-guard] WARNING: failed to remove {cache_file}: "
+                  f"{exc!r}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -558,6 +661,12 @@ def main(argv: Iterable[str] = ()) -> int:
     import torch
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
+
+    # Pre-flight signature check + stale-cache wipe. Runs in well under a
+    # second; aborts before any GPU work if the unsloth/unsloth_zoo pair
+    # would crash at step 0 (see comment block at top of file).
+    _wipe_stale_grpo_cache()
+    _assert_grpo_signature_compatible()
 
     from qubit_medic import wandb_utils
     from qubit_medic.client.client import make_default_client
