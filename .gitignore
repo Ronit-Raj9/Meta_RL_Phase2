@@ -22,7 +22,6 @@ data/sft_dataset.jsonl
 data/baseline_results.json
 data/willow_validation.json
 data/willow_d3.dem
-checkpoints/
 wandb/
 runs/
 

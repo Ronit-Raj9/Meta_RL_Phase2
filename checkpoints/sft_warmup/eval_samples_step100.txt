@@ -1,0 +1,26 @@
+=== eval samples @ step 100 (mode=full, n=100) ===
+
+--- sample 0 (level=L2_target, true_x=[], true_z=[], fmt_ok=True, fmt_strict=True, n_tokens=7) ---
+>>> RAW MODEL OUTPUT:
+X_ERRORS=[] Z_ERRORS=[]
+>>> PARSED: x=[] z=[]
+
+--- sample 1 (level=L2_target, true_x=[], true_z=[], fmt_ok=True, fmt_strict=True, n_tokens=7) ---
+>>> RAW MODEL OUTPUT:
+X_ERRORS=[] Z_ERRORS=[]
+>>> PARSED: x=[] z=[]
+
+--- sample 2 (level=L1_warmup, true_x=[4], true_z=[], fmt_ok=True, fmt_strict=True, n_tokens=9) ---
+>>> RAW MODEL OUTPUT:
+X_ERRORS=[4] Z_ERRORS=[]
+>>> PARSED: x=[4] z=[]
+
+--- sample 3 (level=L2_target, true_x=[0], true_z=[], fmt_ok=True, fmt_strict=True, n_tokens=9) ---
+>>> RAW MODEL OUTPUT:
+X_ERRORS=[1] Z_ERRORS=[]
+>>> PARSED: x=[1] z=[]
+
+--- sample 4 (level=L2_target, true_x=[], true_z=[3, 7], fmt_ok=True, fmt_strict=True, n_tokens=9) ---
+>>> RAW MODEL OUTPUT:
+X_ERRORS=[] Z_ERRORS=[3]
+>>> PARSED: x=[] z=[3]
