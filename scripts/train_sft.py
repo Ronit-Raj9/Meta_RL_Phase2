@@ -187,9 +187,12 @@ def audit_sft_dataset(
     EXPECTED_TRAIN = 3000
     EXPECTED_VAL = 100
     NONEMPTY_LO, NONEMPTY_HI = 0.65, 0.75
-    L1_LO, L1_HI = 0.35, 0.45
-    L2_LO, L2_HI = 0.45, 0.55
-    L3_LO, L3_HI = 0.07, 0.15
+    # Tightened to match quota-based per-level generation in
+    # scripts/generate_sft_data.py, which produces the 40/50/10 split
+    # exactly (no rejection-sampling drift).
+    L1_LO, L1_HI = 0.38, 0.42
+    L2_LO, L2_HI = 0.48, 0.52
+    L3_LO, L3_HI = 0.08, 0.12
     PLEN_MIN, PLEN_MED_LO, PLEN_MED_HI, PLEN_MAX = 800, 1100, 1600, 2200
     CLEN_MIN, CLEN_MED_LO, CLEN_MED_HI, CLEN_MAX = 25, 80, 250, 600
     BARE_MAX = 0.10

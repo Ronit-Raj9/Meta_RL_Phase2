@@ -111,7 +111,12 @@ CURRICULUM: tuple[CurriculumLevel, ...] = (
         name="L1_warmup",
         distance=DISTANCE_PRIMARY,
         rounds=1,
-        p=0.0001,
+        # 0.0005 (was 0.0001) — at the original budget, L1 syndromes were
+        # almost always trivial, dragging the SFT class balance down even
+        # under per-level rejection sampling. Bumping to 0.0005 keeps L1
+        # strictly easier than L2 (p=0.001) while giving the model real
+        # non-empty examples to learn from at the warmup stage.
+        p=0.0005,
         promotion_threshold=0.80,
         eval_size=100,
     ),
