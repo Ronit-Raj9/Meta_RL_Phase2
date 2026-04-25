@@ -227,7 +227,13 @@ def audit_sft_dataset(
     L2_LO, L2_HI = 0.48, 0.52
     L3_LO, L3_HI = 0.08, 0.12
     PLEN_MIN, PLEN_MED_LO, PLEN_MED_HI, PLEN_MAX = 800, 1100, 1600, 2200
-    CLEN_MIN, CLEN_MED_LO, CLEN_MED_HI, CLEN_MAX = 25, 80, 250, 600
+    # CLEN_MED_LO loosened from 80 to 70: the dominant single-X / single-Z
+    # completion at d=3 with a single-digit qubit ID (e.g. "Z-stabilizer
+    # firings localize X-errors to qubit(s) 4. X_ERRORS=[4] Z_ERRORS=[]")
+    # is exactly 78 characters. At p=0.001 ~99% of non-trivial cases are
+    # single-error, which pulls the median to 78 -- structurally correct
+    # data that the previous 80-char floor would mis-flag.
+    CLEN_MIN, CLEN_MED_LO, CLEN_MED_HI, CLEN_MAX = 25, 70, 250, 600
     BARE_MAX = 0.10
 
     train = _audit_file(Path(train_path))
