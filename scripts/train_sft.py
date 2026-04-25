@@ -91,8 +91,12 @@ _LEVEL_D_RE = re.compile(r"Code distance:\s*(\d+)")
 def _detect_level_from_prompt(prompt: str) -> str:
     """Return ``"L1"``/``"L2"``/``"L3"``/``"unknown"`` for an SFT prompt.
 
-    L2 and L3 both run at p=0.001 in our config, so distance is the
-    disambiguator: d=3 -> L2, d=5 -> L3. L1 is the only level at p=0.0001.
+    Used as a fallback for legacy datasets that didn't write a ``level``
+    field into each record. We read the L1/L2/L3 ``p`` and ``distance``
+    values straight from :mod:`qubit_medic.config` rather than hardcoding
+    them, so the audit keeps working when the curriculum is tuned (e.g.
+    L1's ``p`` was bumped from 0.0001 -> 0.0005, which broke the old
+    hardcoded check and made every L1 row read as ``unknown``).
     """
     m_p = _LEVEL_P_RE.search(prompt)
     m_d = _LEVEL_D_RE.search(prompt)
@@ -100,12 +104,41 @@ def _detect_level_from_prompt(prompt: str) -> str:
         return "unknown"
     p = float(m_p.group(1))
     d = int(m_d.group(1))
-    if abs(p - 0.0001) < 1e-9:
-        return "L1"
-    if abs(p - 0.001) < 1e-9 and d == 3:
-        return "L2"
-    if abs(p - 0.001) < 1e-9 and d == 5:
-        return "L3"
+    try:
+        from qubit_medic.config import level_by_name
+        l3 = level_by_name("L3_stretch")
+        l2 = level_by_name("L2_target")
+        l1 = level_by_name("L1_warmup")
+        if d == l3.distance and abs(p - l3.p) < 1e-9:
+            return "L3"
+        if d == l2.distance and abs(p - l2.p) < 1e-9:
+            return "L2"
+        if d == l1.distance and abs(p - l1.p) < 1e-9:
+            return "L1"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _level_label_from_record(rec: dict) -> str:
+    """Return ``"L1"``/``"L2"``/``"L3"``/``"unknown"`` for an SFT record.
+
+    Prefers the explicit ``level`` field written by
+    ``scripts/generate_sft_data.py`` (e.g. ``"L1_warmup"``). Falls back
+    to :func:`_detect_level_from_prompt` for legacy records that lack
+    that field.
+    """
+    raw = rec.get("level")
+    if isinstance(raw, str):
+        if raw.startswith("L1"):
+            return "L1"
+        if raw.startswith("L2"):
+            return "L2"
+        if raw.startswith("L3"):
+            return "L3"
+    prompt = rec.get("prompt")
+    if isinstance(prompt, str):
+        return _detect_level_from_prompt(prompt)
     return "unknown"
 
 
@@ -146,7 +179,7 @@ def _audit_file(path: Path) -> dict:
     anchor = sum(1 for r in rows if _FORMAT_ANCHOR_RE.search(r["completion"].rstrip()))
     levels = {"L1": 0, "L2": 0, "L3": 0, "unknown": 0}
     for r in rows:
-        levels[_detect_level_from_prompt(r["prompt"])] += 1
+        levels[_level_label_from_record(r)] += 1
     plens = [len(r["prompt"]) for r in rows]
     clens = [len(r["completion"]) for r in rows]
     bare = sum(1 for r in rows if r["completion"].strip() == _BARE_FORMAT_LITERAL)

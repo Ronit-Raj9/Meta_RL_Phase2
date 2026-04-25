@@ -104,12 +104,15 @@ LEVEL_QUOTAS_VAL: dict[str, int] = {
     "L3_stretch": 10,    # 10%
 }
 
-# Per-level minimum non-empty correction fraction. ``None`` means "accept
-# all draws naturally" (used for L1 because at p=0.0005 the natural
-# non-empty rate is the right floor on its own and we want the model to
-# learn the trivial case cleanly during warmup).
+# Per-level minimum non-empty correction fraction. The math (with the
+# configured 40/50/10 quota mix) gives:
+#     L1 0.50 + L2 0.80 + L3 0.90 = 0.40*0.50 + 0.50*0.80 + 0.10*0.90 = 0.69
+# which lands solidly inside the audit's 65-75% target band. ``None``
+# would mean "accept all draws naturally" but the natural non-empty rate
+# at L1's p=0.0005 (~3.5%) is too low to satisfy the audit, so we enforce
+# an explicit floor here too.
 PER_LEVEL_NONEMPTY_FLOOR: dict[str, float | None] = {
-    "L1_warmup": None,
+    "L1_warmup": 0.50,   # ~600 non-empty + 600 empty per 1200
     "L2_target": 0.80,   # ~1200 non-empty + 300 empty per 1500
     "L3_stretch": 0.90,  # ~270 non-empty + 30 empty per 300
 }
@@ -161,6 +164,47 @@ def _build_caches() -> dict[str, dict]:
     return caches
 
 
+# Per-level seed offsets so each level draws an independent shot stream
+# from a distinct RNG. Without this, switching from L1 to L2 with the
+# same `seed` would produce identical syndromes (Stim's RNG is per-sampler).
+_LEVEL_SEED_OFFSETS: dict[str, int] = {
+    "L1_warmup": 0,
+    "L2_target": 100_000,
+    "L3_stretch": 200_000,
+}
+
+# Safety cap on shots per level. With L1 floor=0.50 at p=0.0005 (~3.5%
+# natural non-empty rate) we expect ~17k shots; 1M is a generous ceiling
+# that triggers a descriptive error if generation can't converge -- e.g.
+# someone bumped a level's floor too aggressively for its physical error
+# rate.
+_MAX_SHOTS_PER_LEVEL: int = 1_000_000
+
+# Stim's compile_detector_sampler is the slow step (~ms per call); once
+# compiled, sample(N) is essentially free. We sample in chunks of this
+# size to amortise the compile cost across thousands of shots.
+_SHOT_BATCH_SIZE: int = 4096
+
+
+def _level_shot_stream(cache: dict, base_seed: int):
+    """Yield ``(det_row, obs_row)`` tuples lazily from a level's circuit.
+
+    Compiles the detector sampler exactly ONCE per level and then pulls
+    shots in batches of :data:`_SHOT_BATCH_SIZE`. ``det_row`` is a
+    ``np.uint8`` 1-D array (the detector activations); ``obs_row`` is the
+    1-D observables vector for the same shot.
+
+    Determinism: the same ``base_seed`` always produces the same shot
+    sequence regardless of batch size (Stim's per-sampler RNG advances
+    deterministically across each ``sample()`` call).
+    """
+    sampler = cache["circuit"].compile_detector_sampler(seed=base_seed)
+    while True:
+        det, obs = sampler.sample(_SHOT_BATCH_SIZE, separate_observables=True)
+        for i in range(_SHOT_BATCH_SIZE):
+            yield det[i].astype(np.uint8), obs[i]
+
+
 def _generate_split(
     *,
     quotas: dict[str, int],
@@ -169,30 +213,30 @@ def _generate_split(
     out_path: Path,
     rng: random.Random,
 ) -> tuple[int, int, int]:
-    """Quota-based generator. Returns ``(n_written, n_syndrome, n_errors)``.
+    """Quota-based generator with per-level non-empty floors.
+
+    Returns ``(n_written, n_syndrome, n_errors)``.
 
     For each level in ``quotas`` we generate exactly ``quotas[level]`` rows.
-    Within each level, the per-level non-empty floor in
-    :data:`PER_LEVEL_NONEMPTY_FLOOR` controls how aggressively we reject
-    empty draws:
+    Within each level, :data:`PER_LEVEL_NONEMPTY_FLOOR` controls the
+    non-empty/empty split:
 
-      * ``floor=None``  -> accept every draw as it comes (used for L1 so
-        the model still sees clean trivial cases at warmup difficulty).
-      * ``floor=0.80``  -> accept the first ``(1-floor)*quota`` empties,
-        then drop further empties until ``floor*quota`` non-empties have
-        been collected. End state: exact 80/20 non-empty/empty split.
-      * ``floor=0.90``  -> same idea, exact 90/10 split.
+      * ``floor=None`` -> accept every draw until the quota is filled
+        (mostly empty for low-p levels).
+      * ``floor=f``    -> accept exactly ``round(level_n * f)`` non-empty
+        rows and ``level_n - round(level_n * f)`` empty rows. Surplus on
+        either side is dropped, draws continue until both sub-quotas are
+        filled or :data:`_MAX_SHOTS_PER_LEVEL` is exceeded.
 
-    Each completion is ``"{reasoning} {format_line}"`` (see
-    :func:`_build_reasoning`) so prompt and target agree on structure.
+    Stim sampling is batched per level (single ``compile_detector_sampler``
+    call, chunked ``sample()``) so generation is ~1 second per level even
+    when the floor demands tens of thousands of shots.
     """
     written = n_with_syndrome = n_with_errors = 0
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    shot = 0
 
-    # rng is currently unused for sampling decisions (Stim seeds drive
-    # determinism via `shot`) but we keep the param so callers can swap
-    # in different RNG streams later without an API break.
+    # rng kept for caller-API compatibility; sampling determinism is
+    # driven by ``seed`` + per-level offsets.
     del rng
 
     with out_path.open("w") as f:
@@ -202,7 +246,6 @@ def _generate_split(
             floor = PER_LEVEL_NONEMPTY_FLOOR.get(level_name)
 
             if floor is None:
-                # "Natural" mode: take the first ``level_n`` shots as drawn.
                 target_nonempty = None
                 target_empty = None
             else:
@@ -211,14 +254,24 @@ def _generate_split(
 
             level_nonempty = 0
             level_empty = 0
+            shots_drawn = 0
+            level_seed = seed + _LEVEL_SEED_OFFSETS.get(level_name, 0)
+            shots = _level_shot_stream(cache, level_seed)
 
             while (level_nonempty + level_empty) < level_n:
-                shot += 1
-                sampler = cache["circuit"].compile_detector_sampler(
-                    seed=seed + shot,
-                )
-                det, obs = sampler.sample(1, separate_observables=True)
-                det_row = det[0].astype(np.uint8)
+                if shots_drawn >= _MAX_SHOTS_PER_LEVEL:
+                    raise RuntimeError(
+                        f"[gen] level {level_name}: exceeded "
+                        f"_MAX_SHOTS_PER_LEVEL={_MAX_SHOTS_PER_LEVEL} with "
+                        f"only {level_nonempty} non-empty + {level_empty} "
+                        f"empty rows (target: {target_nonempty} non-empty + "
+                        f"{target_empty} empty). Either lower "
+                        f"PER_LEVEL_NONEMPTY_FLOOR[{level_name!r}] or "
+                        f"raise the level's physical error rate in "
+                        f"qubit_medic/config.py."
+                    )
+                det_row, obs_row = next(shots)
+                shots_drawn += 1
 
                 # Optimal correction via PyMatching (X + Z Pauli frame).
                 px_stim, pz_stim = pymatching_predicted_pauli_frame(
@@ -242,6 +295,8 @@ def _generate_split(
                 else:
                     if level_empty >= target_empty:
                         continue  # surplus empty for this level
+
+                actual_obs = int(obs_row[0]) if obs_row.shape[0] else 0
 
                 prompt = build_prompt(
                     distance=cache["level"].distance,
@@ -267,8 +322,8 @@ def _generate_split(
                     "syndrome_bits": [int(b) for b in det_row.tolist()],
                     "true_x_errors": list(map(int, px)),
                     "true_z_errors": list(map(int, pz)),
-                    "actual_observable_flip": int(obs[0, 0]),
-                    "pymatching_observable_pred": int(pm_obs),
+                    "actual_observable_flip": actual_obs,
+                    "pymatching_observable_pred": pm_obs,
                     "had_syndrome": bool(det_row.any()),
                     "had_errors": bool(px or pz),
                 }
@@ -281,6 +336,11 @@ def _generate_split(
                     level_empty += 1
                 if record["had_syndrome"]:
                     n_with_syndrome += 1
+
+            print(f"  [{level_name}] {level_nonempty} non-empty + "
+                  f"{level_empty} empty (drew {shots_drawn} shots, "
+                  f"natural non-empty rate "
+                  f"~{level_nonempty / max(1, shots_drawn):.1%})")
 
     return written, n_with_syndrome, n_with_errors
 
@@ -348,6 +408,20 @@ def main(argv: Iterable[str] = ()) -> int:
         for r in sample_records:
             sf.write(json.dumps(r) + "\n")
     print(f"wrote {len(sample_records)} sample records to {sample_path}")
+
+    # ---- self-audit (fail fast on bad regen) -------------------------- #
+    # Run the same audit train_sft.py runs at startup, so a regen that
+    # silently produced bad data exits non-zero immediately rather than
+    # waiting until the next training launch. Lazy import so we don't
+    # pull in train_sft's heavy ML deps at import time.
+    if not args.no_validation:
+        try:
+            from scripts.train_sft import audit_sft_dataset
+        except ImportError as exc:
+            print(f"[gen] could not run self-audit: {exc}", file=sys.stderr)
+            return 0
+        print()  # blank line before banner
+        audit_sft_dataset(str(train_path), str(val_path))
     return 0
 
 
