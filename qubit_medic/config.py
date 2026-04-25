@@ -241,10 +241,10 @@ DEFAULT_PORT: int = 7860  # Hugging Face Spaces' default exposed port
 # all log to the same project / dashboard. Override per-run on the CLI.
 import os as _os  # noqa: E402  (local import to keep top of module clean)
 
-WANDB_PROJECT: str = _os.environ.get("WANDB_PROJECT", "qubit-medic")
+WANDB_PROJECT: str = _os.environ.get("WANDB_PROJECT", "QuantumScribe")
 """Default W&B project name. Override with ``WANDB_PROJECT=...``."""
 
-WANDB_ENTITY: str | None = _os.environ.get("WANDB_ENTITY") or None
+WANDB_ENTITY: str | None = _os.environ.get("WANDB_ENTITY", "ronitraj") or None
 """W&B team or username. ``None`` -> wandb's default entity for the user."""
 
 WANDB_DEFAULT_TAGS: tuple[str, ...] = (
