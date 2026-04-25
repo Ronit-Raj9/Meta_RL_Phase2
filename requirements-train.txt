@@ -1,0 +1,21 @@
+# Training-time dependencies. Install ON THE TRAINING BOX (Colab T4).
+# These are intentionally NOT in the Spaces image - keep that one slim.
+#
+# Install:
+#   pip install -r requirements.txt
+#   pip install -r requirements-train.txt
+#
+# On Colab T4 the standard recipe is:
+#   !pip install --no-deps unsloth
+#   !pip install -r requirements-train.txt
+
+torch>=2.3
+transformers>=4.44
+trl>=0.13
+unsloth
+datasets>=2.20
+accelerate>=0.30
+peft>=0.11
+wandb>=0.17
+bitsandbytes>=0.43
+sentencepiece>=0.2

@@ -1,0 +1,100 @@
+# OpenEnv manifest (Section 9.1 of the plan).
+# Validate with: openenv validate
+name: qubit-medic
+version: 1.0.0
+description: |
+  RL training environment for LLM-based quantum error-correction decoders.
+
+  Built on Stim + PyMatching with five independent verifiable rewards
+  (logical correction, syndrome consistency, Hamming overlap, format
+  compliance, PyMatching beat-rate). Designed to reproduce the AlphaQubit
+  (Nature 2024) two-stage decoder pipeline at distance-3 with off-the-shelf
+  3B-parameter LLMs trained on a single Colab T4.
+
+authors:
+  - name: Qubit-Medic team
+license: MIT
+homepage: https://huggingface.co/spaces/qubit-medic/qubit-medic
+
+server:
+  module: qubit_medic.server.app
+  app: app
+  protocol: http
+  port: 7860
+
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+    request_model: qubit_medic.models.ResetRequest
+    response_model: qubit_medic.models.DecoderObservation
+  step:
+    method: POST
+    path: /step
+    request_model: qubit_medic.models.StepRequest
+    response_model: qubit_medic.models.StepResult
+  health:
+    method: GET
+    path: /health
+
+models:
+  observation: qubit_medic.models.DecoderObservation
+  action: qubit_medic.models.DecoderAction
+  state: qubit_medic.models.DecoderState
+
+rewards:
+  - name: logical_correction
+    weight: 0.40
+    description: 1 if the predicted Pauli frame preserves the logical Z observable.
+  - name: syndrome_consistency
+    weight: 0.20
+    description: Hamming similarity over final-round detector parities.
+  - name: hamming_overlap
+    weight: 0.20
+    description: Mean Jaccard similarity vs. PyMatching reference Pauli frame.
+  - name: format_compliance
+    weight: 0.10
+    description: 1 / 0.5 / 0 for full / partial / unparseable output.
+  - name: pymatching_beat
+    weight: 0.10
+    description: 1 iff PyMatching wrong AND model right on this syndrome.
+
+curriculum:
+  - name: L1_warmup
+    distance: 3
+    rounds: 1
+    p: 0.0001
+    promotion_threshold: 0.80
+  - name: L2_target
+    distance: 3
+    rounds: 3
+    p: 0.001
+    promotion_threshold: 0.70
+  - name: L3_stretch
+    distance: 5
+    rounds: 5
+    p: 0.001
+    promotion_threshold: 0.30
+
+citations:
+  - bausch_alphaqubit_2024:
+      title: Learning high-accuracy error decoding for quantum processors
+      authors: Bausch et al.
+      venue: Nature 635:834
+      doi: 10.1038/s41586-024-08148-8
+  - acharya_willow_2024:
+      title: Quantum error correction below the surface code threshold
+      authors: Acharya et al. (Google QAI)
+      venue: arXiv:2408.13687
+  - gidney_si1000_2021:
+      title: A fault-tolerant honeycomb memory
+      authors: Gidney & Fowler
+      venue: arXiv:2108.10457
+  - higgott_pymatching_2023:
+      title: Sparse Blossom - PyMatching v2
+      authors: Higgott & Gidney
+      venue: arXiv:2303.15933
+  - shao_grpo_2024:
+      title: DeepSeekMath - introduces GRPO
+      authors: Shao et al.
+      venue: arXiv:2402.03300

@@ -1,0 +1,36 @@
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data + checkpoints
+data/sft_dataset.jsonl
+data/baseline_results.json
+data/willow_validation.json
+data/willow_d3.dem
+checkpoints/
+wandb/
+runs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
