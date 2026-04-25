@@ -77,9 +77,12 @@ set -euo pipefail
 #   TORCH_CUDA=cu124           # override only if Lightning upgrades the driver
 #   TORCH_VERSION=2.5.1        # paired with XFORMERS_VERSION below
 #   XFORMERS_VERSION=0.0.28.post3   # the build matched to torch 2.5.1+cu124
-#   TRL_VERSION=0.15.2         # last trl release that does not import FSDPModule
-#   TRANSFORMERS_VERSION=4.51.3   # known-good with trl 0.15.x + unsloth + torch 2.5.1
-#   SKIP_TORCH_INSTALL=0       # set to 1 if you've already installed a CUDA-matched torch + unsloth
+#   UNSLOTH_VERSION=2025.11.1     # newer unsloth misparses Qwen2.5-3B with old transformers
+#   UNSLOTH_ZOO_VERSION=2026.4.9  # paired with the unsloth pin above
+#   TRL_VERSION=0.20.0            # last trl release that does not import FSDPModule
+#   TRANSFORMERS_VERSION=4.57.2   # known-good with trl 0.20 + unsloth 2025.11.1 + torch 2.5.1
+#   CLEAR_HF_MODEL_CACHE=1        # set to 0 to keep cached Qwen weights between runs
+#   SKIP_TORCH_INSTALL=0          # set to 1 if you've already installed a CUDA-matched torch + unsloth
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -92,10 +95,35 @@ fi
 TORCH_CUDA="${TORCH_CUDA:-cu124}"
 TORCH_VERSION="${TORCH_VERSION:-2.5.1}"
 XFORMERS_VERSION="${XFORMERS_VERSION:-0.0.28.post3}"
-TRL_VERSION="${TRL_VERSION:-0.15.2}"
-TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION:-4.51.3}"
+# unsloth/unsloth_zoo/trl/transformers ALL need to be pinned together.
+# Defaults below match the combination that runs cleanly on Colab T4
+# (Unsloth 2025.11.1 + Transformers 4.57.2 + trl 0.20.0). Mixing
+# unsloth 2026.4.x with transformers 4.51.x causes a silent model-size
+# misparse (3B checkpoint gets loaded into a 7B-shaped model -> shape
+# mismatch on the embedding weight at load time).
+UNSLOTH_VERSION="${UNSLOTH_VERSION:-2025.11.1}"
+UNSLOTH_ZOO_VERSION="${UNSLOTH_ZOO_VERSION:-2026.4.9}"
+TRL_VERSION="${TRL_VERSION:-0.20.0}"
+TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION:-4.57.2}"
 SKIP_TORCH_INSTALL="${SKIP_TORCH_INSTALL:-0}"
+# Clear any stale Qwen model cache from previous failed runs (a partially
+# downloaded or wrong-size model in HF cache can survive across attempts
+# and re-trigger the embedding shape mismatch).
+CLEAR_HF_MODEL_CACHE="${CLEAR_HF_MODEL_CACHE:-1}"
 TORCH_INDEX_URL="https://download.pytorch.org/whl/${TORCH_CUDA}"
+
+if [[ "${CLEAR_HF_MODEL_CACHE}" == "1" ]]; then
+  HF_CACHE_DIR="${HF_HOME:-${HOME}/.cache/huggingface}/hub"
+  if [[ -d "${HF_CACHE_DIR}" ]]; then
+    # Remove any cached Qwen2.5 model dirs (3B, 7B, unsloth quants).
+    # If a previous failed run cached a wrong-size model, leaving it
+    # around silently re-triggers the same shape-mismatch error.
+    echo "[lightning] clearing stale Qwen2.5 model cache under ${HF_CACHE_DIR}"
+    find "${HF_CACHE_DIR}" -maxdepth 1 -type d \
+      \( -iname "models--Qwen--Qwen2.5-*" -o -iname "models--unsloth--qwen2.5-*" \) \
+      -print -exec rm -rf {} + 2>/dev/null || true
+  fi
+fi
 
 if [[ "${SKIP_TORCH_INSTALL}" != "1" ]]; then
   echo "[lightning] upgrading pip"
@@ -126,9 +154,12 @@ PY
     echo "[lightning] existing torch cannot init CUDA on this driver; force-uninstalling torch + xformers + unsloth + trl + transformers"
     python -m pip uninstall -y torch torchvision torchaudio xformers unsloth unsloth_zoo trl transformers || true
   else
-    # torch is fine but trl/transformers may still be at incompatible
-    # versions from a prior install; remove them so step (4) can pin.
-    python -m pip uninstall -y trl transformers || true
+    # torch is fine, but unsloth/unsloth_zoo/trl/transformers may still
+    # be at incompatible versions from a prior install. Force-purge them
+    # so steps (3) and (4) can pin (otherwise pip skips the install
+    # because the package is already present at some version).
+    echo "[lightning] purging existing unsloth / unsloth_zoo / trl / transformers so step (3)/(4) can pin"
+    python -m pip uninstall -y unsloth unsloth_zoo trl transformers || true
   fi
 
   echo "[lightning] (1/6) installing torch==${TORCH_VERSION}+${TORCH_CUDA} from PyTorch's CUDA-matched wheel index"
@@ -142,10 +173,15 @@ PY
     --index-url "${TORCH_INDEX_URL}" \
     "xformers==${XFORMERS_VERSION}"
 
-  echo "[lightning] (3/6) installing unsloth + unsloth_zoo with --no-deps"
+  echo "[lightning] (3/6) installing unsloth==${UNSLOTH_VERSION} + unsloth_zoo==${UNSLOTH_ZOO_VERSION} with --no-deps"
   echo "[lightning]      (this is the same trick the Unsloth Colab notebook uses, so unsloth"
   echo "[lightning]       cannot drag in a newer xformers / torch and undo step 1+2)"
-  python -m pip install --no-deps unsloth unsloth_zoo
+  echo "[lightning]      (PINNED: latest unsloth 2026.4.x misparses Qwen2.5-3B config when paired"
+  echo "[lightning]       with transformers<4.55, instantiating a 7B-shaped model and crashing"
+  echo "[lightning]       on the embedding load with: shape [151936,2048] vs [151936,4096])"
+  python -m pip install --no-deps \
+    "unsloth==${UNSLOTH_VERSION}" \
+    "unsloth_zoo==${UNSLOTH_ZOO_VERSION}"
 
   echo "[lightning] (4/6) installing trl==${TRL_VERSION} + transformers==${TRANSFORMERS_VERSION}"
   echo "[lightning]      (trl>=0.21 imports FSDPModule from torch.distributed.fsdp,"
@@ -206,8 +242,9 @@ except Exception as exc:
     )
     sys.exit(4)
 try:
+    import unsloth
     from unsloth import FastLanguageModel  # noqa: F401
-    print("[lightning] unsloth ok")
+    print(f"[lightning] unsloth={unsloth.__version__} ok")
 except Exception as exc:
     sys.stderr.write(f"[lightning] FATAL: unsloth import failed: {exc}\n")
     sys.exit(5)
