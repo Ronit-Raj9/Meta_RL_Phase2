@@ -209,6 +209,100 @@ and exposed in the `step()` info dict as separate logged scalars.
 
 ---
 
+## Weights & Biases integration
+
+Every training and eval script is wired to W&B through the central
+[`qubit_medic/wandb_utils.py`](qubit_medic/wandb_utils.py) module. Logs
+are bundled by job type so the dashboard reads cleanly:
+
+| Stage | Run group | Key panels |
+|---|---|---|
+| `format_test` | `format_test/*` | parse_success_rate, parse_failure_rate, sample table |
+| `sft` (`train_sft.py`) | `sft/*` | train loss, parse_success_rate, sample completions table, dataset preview |
+| `grpo` (`train_grpo.py`) | `rl/*` and `eval/*` | per-component reward mean/std/min/max, parse rates, curriculum moving averages, env timeout rate, generation table, in-loop greedy eval |
+| `eval` (`eval.py`) | `eval/*` | logical_correction_rate, format_compliance_rate, mean_hamming_overlap, pymatching_beat_rate, mean_total_reward, per-episode table |
+
+### Setup
+
+```bash
+pip install -r requirements-train.txt   # includes wandb
+wandb login                              # paste your API key once
+```
+
+Set `WANDB_PROJECT` and (optionally) `WANDB_ENTITY` once per shell to
+override the defaults from `qubit_medic/config.py`. Disable W&B for any
+script by setting `WANDB_DISABLED=1` or `QUBIT_MEDIC_WANDB=0`.
+
+### Bundling all runs of one experiment
+
+Pass the same `--wandb-group` (or set `GROUP=...` for the Makefile) to
+every stage so SFT, GRPO, and eval show up under one group on the
+dashboard:
+
+```bash
+GROUP=my-experiment-1 make format-test    # writes format_test/* metrics
+GROUP=my-experiment-1 make train-sft      # writes sft/* metrics + adapter artifact
+GROUP=my-experiment-1 make train-grpo     # writes rl/* + eval/* + adapter artifact
+GROUP=my-experiment-1 make eval           # writes final eval/* + per-episode table
+```
+
+The Colab notebook ([`notebooks/colab_train.ipynb`](notebooks/colab_train.ipynb))
+auto-generates a unique `EXPERIMENT_GROUP` and threads it through every
+cell.
+
+### Custom metrics logged
+
+The GRPO trainer's `_RolloutCallback` logs the following on every step,
+in addition to TRL's built-in train metrics:
+
+```
+rl/reward/logical_correction_{mean,std,min,max}
+rl/reward/syndrome_consistency_{mean,std,min,max}
+rl/reward/hamming_overlap_{mean,std,min,max}
+rl/reward/format_compliance_{mean,std,min,max}
+rl/reward/pymatching_beat_{mean,std,min,max}
+rl/reward/total_{mean,std,min,max}
+rl/parse/{success_rate,partial_rate,failure_rate,sample_count}
+rl/curriculum/{L1_warmup,L2_target,L3_stretch}_{mean,samples}
+rl/env/{episodes_started_total,timeouts_total,timeout_rate,mean_elapsed_seconds}
+rl/batch_level_count/{L1_warmup,L2_target,L3_stretch}
+```
+
+Plus, every `--sample-every` steps:
+
+```
+rl/generations         # wandb.Table: prompt | completion | per-reward | curriculum
+```
+
+And every `--inloop-eval-every` steps (deterministic greedy eval):
+
+```
+eval/{logical_correction_rate, format_success_rate, format_partial_rate,
+      pymatching_beat_rate, mean_total_reward, episodes}
+rl/inloop_eval         # wandb.Table: a few sample completions per check
+```
+
+The trained LoRA adapter directories are uploaded as W&B artifacts named
+`sft-adapter-<run-name>` and `grpo-adapter-<run-name>` so downstream eval
+runs can be tied back to a specific training run.
+
+### Architecture: how the per-reward bug got fixed
+
+The naive way to register five reward functions with TRL's `GRPOTrainer`
+is to give each function its own callable - which means each one *also*
+calls `env.reset() + env.step()` independently. That's 5x the env work
+*and* each function ends up scoring against a different syndrome (because
+`reset()` is non-deterministic per call), so the per-component lines on
+W&B would be incoherent.
+
+We fixed this by routing all five reward callables through a shared
+`_BatchScoringCache` keyed on `(prompt, completion)`. The first reward
+function to touch a pair triggers the env round-trip; the next four
+read from the cache. The same cache feeds the W&B callback, so every
+sample on the generations table has a coherent set of five scores.
+
+---
+
 ## Reproducibility
 
 | Item | Locked value |

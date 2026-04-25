@@ -112,7 +112,26 @@ def main(argv: Iterable[str] = ()) -> int:
     parser.add_argument("--syndromes", type=int, default=10)
     parser.add_argument("--samples-per", type=int, default=3)
     parser.add_argument("--out", type=str, default=None)
+    parser.add_argument("--report-to", type=str, default="none",
+                        choices=["wandb", "none"])
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument("--wandb-tags", type=str, nargs="*",
+                        default=("format-test",))
     args = parser.parse_args(list(argv))
+
+    from qubit_medic import wandb_utils
+
+    use_wandb = wandb_utils.derive_report_to(args.report_to) == "wandb"
+    if use_wandb:
+        wandb_utils.init_run(
+            run_name=args.wandb_run_name or wandb_utils.make_run_name(
+                "format-test", suffix=args.backend),
+            job_type="format-test",
+            tags=args.wandb_tags,
+            group=args.wandb_group,
+            extra_config={"cli": vars(args)},
+        )
 
     client = LocalDecoderClient()
     prompts = []
@@ -133,12 +152,22 @@ def main(argv: Iterable[str] = ()) -> int:
     n = len(completions)
     parseable = 0
     partial = 0
-    for c in completions:
+    rows = []
+    for i, c in enumerate(completions):
         parsed = parse_action(c, num_data_qubits=9)
         if parsed.parse_success:
             parseable += 1
         elif parsed.parse_partial:
             partial += 1
+        if use_wandb and i < 30:
+            rows.append({
+                "index": i,
+                "completion": c[:300],
+                "parse_success": parsed.parse_success,
+                "parse_partial": parsed.parse_partial,
+                "x_pred": ",".join(map(str, parsed.x_errors)),
+                "z_pred": ",".join(map(str, parsed.z_errors)),
+            })
 
     rate = parseable / max(1, n)
     verdict = "ABOVE 30% - RL can start directly" if rate >= 0.30 \
@@ -155,6 +184,25 @@ def main(argv: Iterable[str] = ()) -> int:
                 "rate": rate, "verdict": verdict,
                 "completions": completions,
             }, f, indent=2)
+
+    if use_wandb:
+        wandb_utils.log({
+            "format_test/parse_success_rate": rate,
+            "format_test/parse_partial_rate": partial / max(1, n),
+            "format_test/parse_failure_rate": (n - parseable - partial) / max(1, n),
+            "format_test/sample_count": n,
+            "format_test/sft_required": float(rate < 0.30),
+        })
+        wandb_utils.update_summary({
+            "format_test/rate": rate,
+            "format_test/verdict": verdict,
+            "format_test/backend": args.backend,
+            "format_test/model": args.model,
+        })
+        wandb_utils.log_generation_table(
+            rows, step=None, table_name="format_test/samples",
+        )
+        wandb_utils.finish_run()
     return 0
 
 

@@ -5,6 +5,7 @@ PIP ?= .venv/bin/pip
 
 .PHONY: install validate baselines sft-data plots animation tests serve gradio
 .PHONY: all clean docker-build docker-run
+.PHONY: wandb-login train-sft train-grpo eval eval-baseline format-test
 
 install:
 	python3 -m venv .venv
@@ -49,3 +50,37 @@ docker-build:
 
 docker-run:
 	docker run --rm -p 7860:7860 qubit-medic:latest
+
+# ---- W&B-aware training shortcuts ---------------------------------------- #
+# Set WANDB_DISABLED=1 to skip W&B; otherwise these expect `wandb login` to
+# have been run once. Use GROUP=my-experiment to bundle SFT+GRPO+eval runs.
+
+GROUP ?= local-$(shell date +%Y%m%d-%H%M%S)
+
+wandb-login:
+	$(PY) -m wandb login
+
+format-test:
+	$(PY) -m scripts.format_test --backend dummy --report-to wandb \
+	    --wandb-group $(GROUP) --out data/format_test.json
+
+train-sft:
+	$(PY) -m scripts.train_sft --report-to wandb \
+	    --wandb-group $(GROUP) \
+	    --output checkpoints/sft_warmup
+
+train-grpo:
+	$(PY) -m scripts.train_grpo --report-to wandb \
+	    --wandb-group $(GROUP) \
+	    --sft-checkpoint checkpoints/sft_warmup \
+	    --output checkpoints/grpo
+
+eval:
+	$(PY) -m scripts.eval --adapter checkpoints/grpo --episodes 500 \
+	    --report-to wandb --wandb-group $(GROUP) \
+	    --out data/grpo_eval.json
+
+eval-baseline:
+	$(PY) -m scripts.eval --policy pymatching --episodes 500 \
+	    --report-to wandb --wandb-group $(GROUP) \
+	    --out data/baseline_eval.json

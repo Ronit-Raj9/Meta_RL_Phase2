@@ -202,6 +202,42 @@ DEFAULT_PORT: int = 7860  # Hugging Face Spaces' default exposed port
 
 
 # --------------------------------------------------------------------------- #
+# Weights & Biases                                                             #
+# --------------------------------------------------------------------------- #
+# Centralised so the SFT trainer, GRPO trainer, eval script, and notebook
+# all log to the same project / dashboard. Override per-run on the CLI.
+import os as _os  # noqa: E402  (local import to keep top of module clean)
+
+WANDB_PROJECT: str = _os.environ.get("WANDB_PROJECT", "qubit-medic")
+"""Default W&B project name. Override with ``WANDB_PROJECT=...``."""
+
+WANDB_ENTITY: str | None = _os.environ.get("WANDB_ENTITY") or None
+"""W&B team or username. ``None`` -> wandb's default entity for the user."""
+
+WANDB_DEFAULT_TAGS: tuple[str, ...] = (
+    "qubit-medic",
+    "quantum-error-correction",
+    "openenv",
+    f"distance-{DISTANCE_PRIMARY}",
+    "si1000",
+)
+"""Tags applied to every W&B run (per-script tags appended on top)."""
+
+WANDB_LOG_GENERATIONS_EVERY: int = 50
+"""Log a sample-completion table every N GRPO steps."""
+
+WANDB_SAMPLE_GENERATIONS: int = 8
+"""Number of generations included in each sample-completion table."""
+
+WANDB_INLOOP_EVAL_EVERY: int = 200
+"""Run an in-loop evaluation pass (deterministic, ``WANDB_INLOOP_EVAL_EPISODES``
+syndromes) every N GRPO steps. Set to 0 to disable."""
+
+WANDB_INLOOP_EVAL_EPISODES: int = 50
+"""Number of held-out syndromes per in-loop eval pass (kept small for speed)."""
+
+
+# --------------------------------------------------------------------------- #
 # Convenience accessors                                                        #
 # --------------------------------------------------------------------------- #
 
