@@ -271,8 +271,10 @@ import os as _os  # noqa: E402  (local import to keep top of module clean)
 WANDB_PROJECT: str = _os.environ.get("WANDB_PROJECT", "QuantumScribe")
 """Default W&B project name. Override with ``WANDB_PROJECT=...``."""
 
-WANDB_ENTITY: str | None = _os.environ.get("WANDB_ENTITY", "ronitraj") or None
-"""W&B team or username. ``None`` -> wandb's default entity for the user."""
+WANDB_ENTITY: str | None = _os.environ.get("WANDB_ENTITY") or None
+"""W&B team or username. ``None`` -> wandb's default entity for the user
+(inferred from the API key in ``~/.netrc`` after ``wandb login``). Override
+with ``WANDB_ENTITY=...`` when you need to write to a specific team."""
 
 WANDB_DEFAULT_TAGS: tuple[str, ...] = (
     "qubit-medic",

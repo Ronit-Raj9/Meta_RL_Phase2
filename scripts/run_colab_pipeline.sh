@@ -25,11 +25,18 @@ SKIP_WANDB="${SKIP_WANDB:-0}"
 # Lightning boxes).
 SKIP_PIP_INSTALL="${SKIP_PIP_INSTALL:-0}"
 
-if [[ ! -d "${REPO_DIR}" ]]; then
+# If the caller is already inside a clone of this repo (e.g. they ran
+# `git clone -b murtuza ... && cd Meta_RL_Phase2 && bash scripts/run_colab_pipeline.sh`),
+# stay put -- otherwise we'd shadow their checkout with a fresh `main` clone
+# nested at Meta_RL_Phase2/Meta_RL_Phase2/, silently running the wrong code.
+if [[ -d ".git" ]]; then
+  echo "[colab-pipeline] already inside repo at $(pwd); skipping clone"
+elif [[ -d "${REPO_DIR}" ]]; then
+  cd "${REPO_DIR}"
+else
   git clone "${REPO_URL}" "${REPO_DIR}"
+  cd "${REPO_DIR}"
 fi
-
-cd "${REPO_DIR}"
 
 if [[ "${SKIP_PIP_INSTALL}" != "1" ]]; then
   python -m pip install --upgrade pip
