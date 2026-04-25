@@ -163,6 +163,9 @@ def _build_validation_callback(
     tokenizer,
     val_records: list[dict],
     eval_every: int,
+    eval_schedule: tuple[tuple[int, int, str], ...] | None,
+    print_sample_outputs: int,
+    output_dir: str,
     max_new_tokens: int,
     diversity_n_samples: int,
     diversity_temperature: float,
@@ -173,9 +176,26 @@ def _build_validation_callback(
     started_wall: float,
 ):
     """Returns a ``TrainerCallback`` that:
-       * runs every ``eval_every`` steps,
-       * logs the seven spec metrics to W&B,
-       * stops training when the success criterion or the hard caps fire.
+       * fires at every step in ``eval_schedule`` (or every ``eval_every``
+         steps if no schedule is given) with a per-step sample size,
+       * logs the spec metrics + new diagnostic metrics to W&B,
+       * prints the first ``print_sample_outputs`` raw model outputs to
+         stdout AND to ``{output_dir}/eval_samples_step{N}.txt`` so a
+         broken parser / generation drift can be diagnosed in seconds,
+       * stops training when the success criterion or hard caps fire.
+
+    Metric semantics changed in this revision:
+        * Parse failures NO LONGER default to "predict no errors". Failed
+          rows contribute logical_correction=0, hamming=0,
+          syndrome_consistency=0 to the aggregates. This stops trivial
+          syndromes (~95% at p=0.001) from inflating logical_correction_rate
+          to 0.98 while format_compliance sits at 0.01.
+        * New ``eval/parse_failure_rate`` = 1 - format_compliance, so a
+          broken parser is impossible to miss.
+        * New ``eval/format_compliance_strict`` reports the share of
+          outputs that hit the canonical ``X_ERRORS=[...] Z_ERRORS=[...]``
+          form (Reward 4 == 1.0). The looser ``eval/format_compliance``
+          reports the share where the model's answer was extractable at all.
     """
     from transformers import TrainerCallback
 
@@ -196,6 +216,19 @@ def _build_validation_callback(
     diversity_record = val_records[0]
     diversity_messages = [{"role": "user", "content": diversity_record["prompt"]}]
 
+    # Index the schedule: step -> (sample_size, mode). Sample sizes are
+    # capped at len(val_records) so a small held-out set still works.
+    if eval_schedule:
+        schedule = {
+            step: (min(size, len(val_records)), mode)
+            for step, size, mode in eval_schedule
+        }
+    else:
+        schedule = {}
+
+    sample_dir = Path(output_dir)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
     class _ValidationCallback(TrainerCallback):
         # Stamp the most recent eval here so the on_train_end hook can avoid
         # re-running if the eval step coincided with the final step.
@@ -209,8 +242,15 @@ def _build_validation_callback(
                 control.should_training_stop = True
                 return
 
-            if state.global_step == 0 or state.global_step % eval_every != 0:
+            step = state.global_step
+            if step == 0:
                 return
+            if schedule:
+                if step not in schedule:
+                    return
+            else:
+                if step % eval_every != 0:
+                    return
             self._run_eval(state, control)
 
         def on_train_end(self, args, state, control, **kwargs):  # noqa: D401
@@ -269,103 +309,170 @@ def _build_validation_callback(
             except Exception:
                 model.eval()  # type: ignore[attr-defined]
 
-            n = len(val_records)
-            n_format = n_logical = n_exact = 0
+            step = state.global_step
+            # Resolve sample size + mode for this step.
+            if final and step in schedule:
+                sample_size, mode = schedule[step]
+            elif final:
+                sample_size, mode = len(val_records), "full"
+            elif step in schedule:
+                sample_size, mode = schedule[step]
+            else:
+                sample_size, mode = len(val_records), "full"
+
+            # Deterministic slice so the same prompts are used across checkpoints.
+            records = val_records[:sample_size]
+            n = len(records)
+            full_eval = (mode == "full")
+
+            n_format = 0          # lenient parse_success
+            n_format_strict = 0   # canonical "=" + "[]"
+            n_logical = n_exact = 0
             sum_hamming = 0.0
             sum_syndrome = 0.0
             sum_length = 0
             rows: list[dict] = []
+            sample_dump_lines: list[str] = [
+                f"=== eval samples @ step {step} (mode={mode}, n={n}) ===",
+            ]
 
-            for idx, rec in enumerate(val_records):
-                cache = level_caches[rec["level"]]
-                layout = cache["layout"]
-                supports = cache["supports"]
-
+            for idx, rec in enumerate(records):
+                num_data = int(rec["num_data_qubits"])
                 messages = [{"role": "user", "content": rec["prompt"]}]
                 completion, n_tokens = self._generate_greedy(messages)
                 sum_length += n_tokens
 
-                num_data = int(rec["num_data_qubits"])
                 parsed = parse_action(completion, num_data_qubits=num_data)
-                sample = SyndromeSample(
-                    syndrome_bits=list(map(int, rec["syndrome_bits"])),
-                    actual_observable_flip=int(rec["actual_observable_flip"]),
-                    pymatching_observable_pred=int(rec["pymatching_observable_pred"]),
-                    pymatching_x_errors=list(map(int, rec["true_x_errors"])),
-                    pymatching_z_errors=list(map(int, rec["true_z_errors"])),
-                )
-                breakdown = compute_all_rewards(parsed, sample, layout, supports)
-
                 fmt_ok = parsed.parse_success
-                logical_ok = breakdown.logical_correction >= 0.5
-                exact_ok = (
-                    fmt_ok
-                    and parsed.x_errors == sorted(set(rec["true_x_errors"]))
-                    and parsed.z_errors == sorted(set(rec["true_z_errors"]))
-                )
+                fmt_strict_ok = bool(parsed.strict_format)
                 n_format += int(fmt_ok)
+                n_format_strict += int(fmt_strict_ok)
+
+                # Physics-heavy metrics only in "full" mode AND only when
+                # the parse actually succeeded. A failed parse means the
+                # model didn't produce a usable prediction; we score that
+                # as a miss (0) for every downstream metric instead of
+                # silently substituting an empty Pauli frame, which would
+                # accidentally score correct on the ~95% of trivial
+                # syndromes at p=0.001.
+                logical_ok = False
+                exact_ok = False
+                hamming = 0.0
+                syndrome = 0.0
+                if full_eval and fmt_ok:
+                    cache = level_caches[rec["level"]]
+                    layout = cache["layout"]
+                    supports = cache["supports"]
+                    sample = SyndromeSample(
+                        syndrome_bits=list(map(int, rec["syndrome_bits"])),
+                        actual_observable_flip=int(rec["actual_observable_flip"]),
+                        pymatching_observable_pred=int(rec["pymatching_observable_pred"]),
+                        pymatching_x_errors=list(map(int, rec["true_x_errors"])),
+                        pymatching_z_errors=list(map(int, rec["true_z_errors"])),
+                    )
+                    breakdown = compute_all_rewards(parsed, sample, layout, supports)
+                    logical_ok = breakdown.logical_correction >= 0.5
+                    hamming = float(breakdown.hamming_overlap)
+                    syndrome = float(breakdown.syndrome_consistency)
+                    exact_ok = (
+                        parsed.x_errors == sorted(set(rec["true_x_errors"]))
+                        and parsed.z_errors == sorted(set(rec["true_z_errors"]))
+                    )
+
                 n_logical += int(logical_ok)
                 n_exact += int(exact_ok)
-                sum_hamming += float(breakdown.hamming_overlap)
-                sum_syndrome += float(breakdown.syndrome_consistency)
+                sum_hamming += hamming
+                sum_syndrome += syndrome
 
-                if idx < 4:  # keep table tiny
+                if idx < print_sample_outputs:
+                    sample_dump_lines.append(
+                        f"\n--- sample {idx} (level={rec['level']}, "
+                        f"true_x={rec['true_x_errors']}, true_z={rec['true_z_errors']}, "
+                        f"fmt_ok={fmt_ok}, fmt_strict={fmt_strict_ok}, "
+                        f"n_tokens={n_tokens}) ---\n"
+                        f">>> RAW MODEL OUTPUT:\n{completion}\n"
+                        f">>> PARSED: x={parsed.x_errors} z={parsed.z_errors}"
+                    )
+
+                if idx < 4:  # keep W&B table tiny
                     rows.append({
-                        "step": state.global_step,
+                        "step": step,
                         "prompt": rec["prompt"][:600],
                         "gold": rec["completion"],
                         "model": completion[:300],
                         "x_pred": ",".join(map(str, parsed.x_errors)),
                         "z_pred": ",".join(map(str, parsed.z_errors)),
                         "format_ok": fmt_ok,
+                        "format_strict_ok": fmt_strict_ok,
                         "logical_ok": logical_ok,
                         "exact_match": exact_ok,
-                        "hamming_overlap": breakdown.hamming_overlap,
+                        "hamming_overlap": hamming,
                     })
 
-            # ---------- diversity probe (one prompt, N samples, T=0.7) -- #
-            diverse_outputs: list[str] = []
-            for _ in range(diversity_n_samples):
-                diverse_outputs.append(self._generate_sampled(diversity_messages))
-            output_diversity = len(set(diverse_outputs))
+            # ---------- print + persist raw output samples -------------- #
+            sample_blob = "\n".join(sample_dump_lines)
+            print(sample_blob)
+            try:
+                (sample_dir / f"eval_samples_step{step}.txt").write_text(sample_blob)
+            except OSError as exc:
+                print(f"[sft][eval@{step}] could not persist sample outputs: {exc}")
+
+            # ---------- diversity probe (skip in format_only mode) ------ #
+            if full_eval:
+                diverse_outputs: list[str] = []
+                for _ in range(diversity_n_samples):
+                    diverse_outputs.append(self._generate_sampled(diversity_messages))
+                output_diversity = len(set(diverse_outputs))
+            else:
+                output_diversity = 0  # not measured this step
 
             # ---------- aggregate + log to W&B ------------------------- #
-            metrics = {
+            metrics: dict[str, float | int] = {
                 "eval/format_compliance": n_format / max(1, n),
-                "eval/logical_correction_rate": n_logical / max(1, n),
-                "eval/exact_match_pymatching": n_exact / max(1, n),
-                "eval/hamming_overlap_mean": sum_hamming / max(1, n),
-                "eval/syndrome_consistency": sum_syndrome / max(1, n),
+                "eval/format_compliance_strict": n_format_strict / max(1, n),
+                "eval/parse_failure_rate": 1.0 - (n_format / max(1, n)),
                 "eval/output_length_mean": sum_length / max(1, n),
-                "eval/output_diversity": output_diversity,
                 "eval/episodes": n,
+                "eval/mode_full": int(full_eval),
             }
-            print(f"[sft][eval@{state.global_step}] " + ", ".join(
+            if full_eval:
+                metrics.update({
+                    "eval/logical_correction_rate": n_logical / max(1, n),
+                    "eval/exact_match_pymatching": n_exact / max(1, n),
+                    "eval/hamming_overlap_mean": sum_hamming / max(1, n),
+                    "eval/syndrome_consistency": sum_syndrome / max(1, n),
+                    "eval/output_diversity": output_diversity,
+                })
+            print(f"[sft][eval@{step}] " + ", ".join(
                 f"{k.split('/')[-1]}={v:.3f}" if isinstance(v, float) else f"{k.split('/')[-1]}={v}"
                 for k, v in metrics.items()
             ))
-            wandb_utils.log(metrics, step=state.global_step)
+            wandb_utils.log(metrics, step=step)
             wandb_utils.log_generation_table(
-                rows, step=state.global_step,
+                rows, step=step,
                 table_name=("sft/final_validation" if final else "sft/validation"),
                 columns=["step", "prompt", "gold", "model", "x_pred", "z_pred",
-                         "format_ok", "logical_ok", "exact_match", "hamming_overlap"],
+                         "format_ok", "format_strict_ok", "logical_ok",
+                         "exact_match", "hamming_overlap"],
             )
 
             # ---------- early stop checks ------------------------------ #
-            success = (
-                metrics["eval/format_compliance"] >= early_stop_format
-                and metrics["eval/logical_correction_rate"] >= early_stop_correction
-                and metrics["eval/output_diversity"] >= early_stop_diversity
-            )
-            if success and not final:
-                print(f"[sft] success criterion hit at step {state.global_step}: "
-                      f"format={metrics['eval/format_compliance']:.3f} >= {early_stop_format}, "
-                      f"correction={metrics['eval/logical_correction_rate']:.3f} >= {early_stop_correction}, "
-                      f"diversity={int(metrics['eval/output_diversity'])} >= {early_stop_diversity}; "
-                      f"stopping.")
-                control.should_training_stop = True
-                wandb_utils.update_summary({"sft/early_stop_reason": "success_criterion"})
+            # Only meaningful on full evals: logical_correction_rate and
+            # output_diversity are not measured in format_only mode.
+            if full_eval:
+                success = (
+                    metrics["eval/format_compliance"] >= early_stop_format
+                    and metrics["eval/logical_correction_rate"] >= early_stop_correction
+                    and metrics["eval/output_diversity"] >= early_stop_diversity
+                )
+                if success and not final:
+                    print(f"[sft] success criterion hit at step {state.global_step}: "
+                          f"format={metrics['eval/format_compliance']:.3f} >= {early_stop_format}, "
+                          f"correction={metrics['eval/logical_correction_rate']:.3f} >= {early_stop_correction}, "
+                          f"diversity={int(metrics['eval/output_diversity'])} >= {early_stop_diversity}; "
+                          f"stopping.")
+                    control.should_training_stop = True
+                    wandb_utils.update_summary({"sft/early_stop_reason": "success_criterion"})
 
             try:
                 from unsloth import FastLanguageModel
@@ -438,7 +545,15 @@ def main(argv: Iterable[str] = ()) -> int:
     parser.add_argument("--wandb-tags", type=str, nargs="*", default=("sft",))
     parser.add_argument("--wandb-notes", type=str, default=None)
     parser.add_argument("--eval-every", type=int, default=None,
-                        help="run validation pass every N steps (default 50)")
+                        help="run validation pass every N steps (legacy "
+                             "fallback when --no-eval-schedule is set)")
+    parser.add_argument("--no-eval-schedule", action="store_true",
+                        help="disable the variable-cadence schedule "
+                             "(SFT_EVAL_SCHEDULE) and fall back to "
+                             "uniform --eval-every spacing")
+    parser.add_argument("--print-sample-outputs", type=int,
+                        default=SFT_PRINT_SAMPLE_OUTPUTS,
+                        help="N raw model outputs to print + persist per eval")
     parser.add_argument("--diversity-samples", type=int, default=10,
                         help="N samples for the output_diversity probe")
     parser.add_argument("--diversity-temperature", type=float, default=0.7)
@@ -461,9 +576,10 @@ def main(argv: Iterable[str] = ()) -> int:
         LORA_ALPHA, LORA_DROPOUT, LORA_R, LORA_TARGET_MODULES, MODEL_ID,
         PRIMARY_SEED, SFT_BATCH_SIZE, SFT_EARLY_STOP_CORRECTION,
         SFT_EARLY_STOP_DIVERSITY, SFT_EARLY_STOP_FORMAT, SFT_EPOCHS,
-        SFT_EVAL_EVERY, SFT_GRAD_ACCUM, SFT_LOG_EVERY, SFT_LR,
-        SFT_LR_SCHEDULER, SFT_MAX_NEW_TOKENS, SFT_MAX_SEQ_LEN, SFT_MAX_STEPS,
-        SFT_MAX_WALL_SECONDS, SFT_OPTIMIZER, SFT_SAVE_EVERY, SFT_WARMUP_STEPS,
+        SFT_EVAL_EVERY, SFT_EVAL_SCHEDULE, SFT_GRAD_ACCUM, SFT_LOG_EVERY,
+        SFT_LR, SFT_LR_SCHEDULER, SFT_MAX_NEW_TOKENS, SFT_MAX_SEQ_LEN,
+        SFT_MAX_STEPS, SFT_MAX_WALL_SECONDS, SFT_OPTIMIZER,
+        SFT_PRINT_SAMPLE_OUTPUTS, SFT_SAVE_EVERY, SFT_WARMUP_STEPS,
         SFT_WEIGHT_DECAY,
     )
 
@@ -565,7 +681,7 @@ def main(argv: Iterable[str] = ()) -> int:
         "sft/train_dataset_size": len(train_dataset),
         "sft/val_dataset_size": len(val_records),
         "sft/first_text_len": len(train_dataset[0]["text"]),
-    })
+    }, step=0)
 
     # Dataset preview to W&B (sanity check the chat-template wrapping).
     wandb_utils.log_generation_table(
@@ -608,11 +724,15 @@ def main(argv: Iterable[str] = ()) -> int:
     # ---- Callbacks --------------------------------------------------- #
     started_wall = time.time()
     callbacks = [_build_loss_guard_callback()]
+    eval_schedule = None if args.no_eval_schedule else SFT_EVAL_SCHEDULE
     val_cb = _build_validation_callback(
         model=model,
         tokenizer=tokenizer,
         val_records=val_records,
         eval_every=eval_every,
+        eval_schedule=eval_schedule,
+        print_sample_outputs=args.print_sample_outputs,
+        output_dir=args.output,
         max_new_tokens=SFT_MAX_NEW_TOKENS,
         diversity_n_samples=args.diversity_samples,
         diversity_temperature=args.diversity_temperature,

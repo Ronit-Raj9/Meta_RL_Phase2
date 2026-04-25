@@ -565,7 +565,7 @@ def main(argv: Iterable[str] = ()) -> int:
         "sft/train_dataset_size": len(train_dataset),
         "sft/val_dataset_size": len(val_records),
         "sft/first_text_len": len(train_dataset[0]["text"]),
-    })
+    }, step=0)
 
     # Dataset preview to W&B (sanity check the chat-template wrapping).
     wandb_utils.log_generation_table(

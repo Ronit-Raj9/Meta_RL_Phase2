@@ -188,10 +188,32 @@ SFT_DATASET_SIZE: int = 3_000        # 3,000 train + 100 held-out validation
 SFT_VAL_HOLDOUT: int = 100
 SFT_MAX_SEQ_LEN: int = 1024          # ~300 prompt + ~80 completion + headroom
 SFT_MAX_STEPS: int = 200             # hard cap; 3000/16=187.5 expected
-SFT_EVAL_EVERY: int = 50
+SFT_EVAL_EVERY: int = 50             # legacy fallback if no schedule given
 SFT_SAVE_EVERY: int = 50
 SFT_LOG_EVERY: int = 10
 SFT_MAX_NEW_TOKENS: int = 128        # generation cap during eval
+
+# --- Variable eval cadence ------------------------------------------------- #
+# Early evals are quick sanity checks (small sample, format-only) so a
+# broken parser / generation drift gets caught before ~10 min of compute is
+# burned. Late evals are real measurements with the full sample size.
+# Catching format-compliance failure at step 15 instead of step 50 saves
+# ~7 minutes per fire.
+#
+# Each entry: (step, sample_size, mode) where mode is "format_only" or
+# "full". format_only skips the diversity probe and the physics-heavy
+# logical_correction / hamming / syndrome metrics, so the eval costs
+# ~30 seconds instead of ~2 minutes.
+SFT_EVAL_SCHEDULE: tuple[tuple[int, int, str], ...] = (
+    (5,   30,  "format_only"),
+    (15,  30,  "format_only"),
+    (30,  50,  "full"),
+    (50,  100, "full"),
+    (100, 100, "full"),
+    (150, 100, "full"),
+    (190, 200, "full"),
+)
+SFT_PRINT_SAMPLE_OUTPUTS: int = 5    # raw outputs printed at each eval
 
 # Early-stop thresholds (master spec, section 3).
 SFT_EARLY_STOP_FORMAT: float = 0.95

@@ -85,3 +85,86 @@ def test_empty_lists():
     assert p.parse_success is True
     assert p.x_errors == []
     assert p.z_errors == []
+    assert p.strict_format is True
+    assert p.format_score == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Lenient-mode tests (new): parser must surface the model's answer even when
+# the format drifts slightly, while keeping `strict_format` False so the GRPO
+# Reward 4 still pushes the model toward the canonical wording.
+# --------------------------------------------------------------------------- #
+
+
+def test_lenient_colon_separator():
+    p = parse_action("X_ERRORS: [1,3] Z_ERRORS: [2]", num_data_qubits=9)
+    assert p.parse_success is True
+    assert p.x_errors == [1, 3]
+    assert p.z_errors == [2]
+    assert p.strict_format is False
+    assert p.format_score == 0.5  # lenient, not canonical
+
+
+def test_lenient_parens():
+    p = parse_action("X_ERRORS=(1,3) Z_ERRORS=(2)", num_data_qubits=9)
+    assert p.parse_success is True
+    assert p.x_errors == [1, 3]
+    assert p.z_errors == [2]
+    assert p.strict_format is False
+
+
+def test_lenient_dashed_key():
+    p = parse_action("X-ERRORS=[1] Z-ERRORS=[2]", num_data_qubits=9)
+    assert p.parse_success is True
+    assert p.x_errors == [1]
+    assert p.z_errors == [2]
+    assert p.strict_format is False
+
+
+def test_lenient_spaced_key():
+    p = parse_action("X ERRORS=[1] Z ERRORS=[2]", num_data_qubits=9)
+    assert p.parse_success is True
+    assert p.x_errors == [1]
+    assert p.z_errors == [2]
+    assert p.strict_format is False
+
+
+def test_strict_format_flag_for_canonical():
+    p = parse_action("X_ERRORS=[1] Z_ERRORS=[2]", num_data_qubits=9)
+    assert p.strict_format is True
+    assert p.format_score == 1.0
+
+
+def test_boxed_latex_wrapper_unwraps():
+    raw = (
+        "Looking at the syndrome, only one bit fired.\n"
+        r"\boxed{X_ERRORS=[3] Z_ERRORS=[]}"
+    )
+    p = parse_action(raw, num_data_qubits=9)
+    assert p.parse_success is True
+    assert p.x_errors == [3]
+    assert p.z_errors == []
+    assert p.strict_format is True
+
+
+def test_reasoning_then_canonical_answer_is_strict():
+    raw = (
+        "The bottom-right Z stabilizer fired in round 2, suggesting an X on "
+        "qubit 7. Final answer: X_ERRORS=[7] Z_ERRORS=[]"
+    )
+    p = parse_action(raw, num_data_qubits=9)
+    assert p.parse_success is True
+    assert p.x_errors == [7]
+    assert p.z_errors == []
+    assert p.strict_format is True
+
+
+def test_lenient_does_not_rescue_pure_garbage():
+    p = parse_action(
+        "Looking at this, qubits 3 and 5 might be flipped.",
+        num_data_qubits=9,
+    )
+    assert p.parse_success is False
+    assert p.parse_partial is False
+    assert p.strict_format is False
+    assert p.format_score == 0.0
