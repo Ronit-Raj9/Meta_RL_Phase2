@@ -60,11 +60,253 @@ import argparse
 import json
 import os
 import random
+import re
+import statistics
 import sys
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, Optional
+
+
+# --------------------------------------------------------------------------- #
+# Pre-flight dataset audit                                                    #
+# --------------------------------------------------------------------------- #
+# Runs as the FIRST step of main(), before any model/tokenizer/heavy imports.
+# Catches dataset regressions (class collapse, format drift, parse breakage,
+# size mismatches) in a few seconds, before burning ~30 min of GPU on a run
+# that was doomed at row 0.
+#
+# 9 checks, 3 of them duplicated on the validation split. Any failure raises
+# SystemExit(2) so the Colab/Lightning shell pipeline exits with a non-zero
+# status and won't proceed to model loading.
+
+_BARE_FORMAT_LITERAL = "X_ERRORS=[] Z_ERRORS=[]"
+_FORMAT_ANCHOR_RE = re.compile(r"X_ERRORS=\[[\d,\s]*\]\s*Z_ERRORS=\[[\d,\s]*\]\s*$")
+_TAIL_RE = re.compile(r"X_ERRORS=\[([^\]]*)\]\s*Z_ERRORS=\[([^\]]*)\]\s*$")
+_LEVEL_P_RE = re.compile(r"Physical error rate:\s*([\d.]+)")
+_LEVEL_D_RE = re.compile(r"Code distance:\s*(\d+)")
+
+
+def _detect_level_from_prompt(prompt: str) -> str:
+    """Return ``"L1"``/``"L2"``/``"L3"``/``"unknown"`` for an SFT prompt.
+
+    L2 and L3 both run at p=0.001 in our config, so distance is the
+    disambiguator: d=3 -> L2, d=5 -> L3. L1 is the only level at p=0.0001.
+    """
+    m_p = _LEVEL_P_RE.search(prompt)
+    m_d = _LEVEL_D_RE.search(prompt)
+    if not m_p or not m_d:
+        return "unknown"
+    p = float(m_p.group(1))
+    d = int(m_d.group(1))
+    if abs(p - 0.0001) < 1e-9:
+        return "L1"
+    if abs(p - 0.001) < 1e-9 and d == 3:
+        return "L2"
+    if abs(p - 0.001) < 1e-9 and d == 5:
+        return "L3"
+    return "unknown"
+
+
+def _has_nonempty_correction(completion: str) -> bool:
+    """True iff the completion's trailing format line predicts at least one
+    error (X or Z). Robust to a leading reasoning prefix.
+    """
+    m = _TAIL_RE.search(completion.rstrip())
+    if m is None:
+        return False
+    return bool(m.group(1).strip()) or bool(m.group(2).strip())
+
+
+def _audit_file(path: Path) -> dict:
+    """Compute raw audit metrics for one JSONL file."""
+    if not path.exists():
+        return {"error": f"missing file: {path}"}
+    rows: list[dict] = []
+    parse_failures = 0
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                parse_failures += 1
+                continue
+            if "prompt" not in rec or "completion" not in rec:
+                parse_failures += 1
+                continue
+            rows.append(rec)
+    n = len(rows)
+    total_lines = n + parse_failures
+    parse_rate = (n / total_lines) if total_lines else 0.0
+    nonempty = sum(_has_nonempty_correction(r["completion"]) for r in rows)
+    anchor = sum(1 for r in rows if _FORMAT_ANCHOR_RE.search(r["completion"].rstrip()))
+    levels = {"L1": 0, "L2": 0, "L3": 0, "unknown": 0}
+    for r in rows:
+        levels[_detect_level_from_prompt(r["prompt"])] += 1
+    plens = [len(r["prompt"]) for r in rows]
+    clens = [len(r["completion"]) for r in rows]
+    bare = sum(1 for r in rows if r["completion"].strip() == _BARE_FORMAT_LITERAL)
+    return {
+        "n": n,
+        "parse_failures": parse_failures,
+        "parse_rate": parse_rate,
+        "nonempty_frac": (nonempty / n) if n else 0.0,
+        "anchor_frac": (anchor / n) if n else 0.0,
+        "level_pct": {k: ((v / n) if n else 0.0) for k, v in levels.items()},
+        "plens": plens,
+        "clens": clens,
+        "bare_frac": (bare / n) if n else 0.0,
+    }
+
+
+def audit_sft_dataset(
+    train_path: str = "data/sft_dataset.jsonl",
+    val_path: str = "data/sft_validation.jsonl",
+) -> None:
+    """Pre-flight audit of the SFT dataset. Halts (SystemExit) on violation.
+
+    Runs 9 checks against ``train_path`` plus 4 parallel checks against
+    ``val_path``. Designed to run in seconds on the CPU before any heavy
+    ML deps are imported, so a broken dataset never reaches the GPU.
+
+    Locked thresholds:
+        Total rows:           train=3000, val=100
+        JSON parse rate:      100%
+        Non-empty correction: 65-75%
+        Format anchor:        100%
+        Curriculum L1/L2/L3:  35-45% / 45-55% / 7-15%
+        Prompt length:        min>=800, median in [1100,1600], max<=2200
+        Completion length:    min>=25, median in [80,250], max<=600
+        Bare-format-only:     <=10%
+        Validation parallel:  same thresholds applied to val split
+    """
+    EXPECTED_TRAIN = 3000
+    EXPECTED_VAL = 100
+    NONEMPTY_LO, NONEMPTY_HI = 0.65, 0.75
+    L1_LO, L1_HI = 0.35, 0.45
+    L2_LO, L2_HI = 0.45, 0.55
+    L3_LO, L3_HI = 0.07, 0.15
+    PLEN_MIN, PLEN_MED_LO, PLEN_MED_HI, PLEN_MAX = 800, 1100, 1600, 2200
+    CLEN_MIN, CLEN_MED_LO, CLEN_MED_HI, CLEN_MAX = 25, 80, 250, 600
+    BARE_MAX = 0.10
+
+    train = _audit_file(Path(train_path))
+    if "error" in train:
+        print(f"[audit] FATAL: {train['error']}")
+        raise SystemExit(2)
+
+    # ------------------------------- train checks ------------------------- #
+    checks: list[tuple[str, str, bool]] = []
+
+    checks.append((
+        "Total rows",
+        f"{train['n']} (expected {EXPECTED_TRAIN})",
+        train["n"] == EXPECTED_TRAIN,
+    ))
+    checks.append((
+        "JSON parse rate",
+        f"{train['parse_rate'] * 100:.1f}% ({train['parse_failures']} failures)",
+        abs(train["parse_rate"] - 1.0) < 1e-9,
+    ))
+    checks.append((
+        "Non-empty correction",
+        f"{train['nonempty_frac'] * 100:.1f}% (target 65-75%)",
+        NONEMPTY_LO <= train["nonempty_frac"] <= NONEMPTY_HI,
+    ))
+    checks.append((
+        "Format anchor",
+        f"{train['anchor_frac'] * 100:.1f}%",
+        abs(train["anchor_frac"] - 1.0) < 1e-9,
+    ))
+
+    p1 = train["level_pct"]["L1"]
+    p2 = train["level_pct"]["L2"]
+    p3 = train["level_pct"]["L3"]
+    p_unknown = train["level_pct"]["unknown"]
+    checks.append((
+        "Curriculum L1/L2/L3",
+        f"{p1*100:.1f}/{p2*100:.1f}/{p3*100:.1f}% (unknown={p_unknown*100:.1f}%)",
+        (L1_LO <= p1 <= L1_HI
+         and L2_LO <= p2 <= L2_HI
+         and L3_LO <= p3 <= L3_HI),
+    ))
+
+    pmin = min(train["plens"]) if train["plens"] else 0
+    pmed = int(statistics.median(train["plens"])) if train["plens"] else 0
+    pmax = max(train["plens"]) if train["plens"] else 0
+    checks.append((
+        "Prompt length",
+        f"min={pmin} median={pmed} max={pmax}",
+        (pmin >= PLEN_MIN
+         and PLEN_MED_LO <= pmed <= PLEN_MED_HI
+         and pmax <= PLEN_MAX),
+    ))
+
+    cmin = min(train["clens"]) if train["clens"] else 0
+    cmed = int(statistics.median(train["clens"])) if train["clens"] else 0
+    cmax = max(train["clens"]) if train["clens"] else 0
+    checks.append((
+        "Completion length",
+        f"min={cmin} median={cmed} max={cmax}",
+        (cmin >= CLEN_MIN
+         and CLEN_MED_LO <= cmed <= CLEN_MED_HI
+         and cmax <= CLEN_MAX),
+    ))
+
+    checks.append((
+        "Bare-format completions",
+        f"{train['bare_frac'] * 100:.1f}% (max 10%)",
+        train["bare_frac"] <= BARE_MAX,
+    ))
+
+    # ------------------------------- val parallel ------------------------- #
+    val = _audit_file(Path(val_path))
+    if "error" in val:
+        checks.append(("Validation parallel", val["error"], False))
+    else:
+        v1 = val["level_pct"]["L1"]
+        v2 = val["level_pct"]["L2"]
+        v3 = val["level_pct"]["L3"]
+        val_pass = (
+            val["n"] == EXPECTED_VAL
+            and abs(val["parse_rate"] - 1.0) < 1e-9
+            and NONEMPTY_LO <= val["nonempty_frac"] <= NONEMPTY_HI
+            and abs(val["anchor_frac"] - 1.0) < 1e-9
+            and L1_LO <= v1 <= L1_HI
+            and L2_LO <= v2 <= L2_HI
+            and L3_LO <= v3 <= L3_HI
+        )
+        val_summary = (
+            f"rows={val['n']} parse={val['parse_rate']*100:.0f}% "
+            f"nonempty={val['nonempty_frac']*100:.1f}% "
+            f"anchor={val['anchor_frac']*100:.0f}% "
+            f"L1/L2/L3={v1*100:.1f}/{v2*100:.1f}/{v3*100:.1f}%"
+        )
+        checks.append(("Validation parallel", val_summary, val_pass))
+
+    # ------------------------------- print banner ------------------------- #
+    print()
+    print("DATASET AUDIT SUMMARY")
+    print("=" * 21)
+    label_w = max(len(label) for label, _, _ in checks) + 1
+    val_w = max(len(val_str) for _, val_str, _ in checks)
+    for label, val_str, passed in checks:
+        mark = "✓" if passed else "✗"  # ✓ / ✗
+        print(f"{(label + ':').ljust(label_w + 1)} {val_str.ljust(val_w)} [{mark}]")
+
+    all_passed = all(passed for _, _, passed in checks)
+    print()
+    if all_passed:
+        print("ALL CHECKS PASSED — DATASET READY FOR TRAINING")
+        print()
+        return
+    print("AUDIT FAILED — FIX DATASET BEFORE TRAINING")
+    print()
+    raise SystemExit(2)
 
 
 # --------------------------------------------------------------------------- #
@@ -560,6 +802,11 @@ def main(argv: Iterable[str] = ()) -> int:
     parser.add_argument("--diversity-temperature", type=float, default=0.7)
     parser.add_argument("--no-artifact", action="store_true")
     args = parser.parse_args(list(argv))
+
+    # Pre-flight dataset audit. Runs in seconds on the CPU before any heavy
+    # ML deps are imported, so a broken dataset never reaches the GPU. Halts
+    # via SystemExit(2) on any threshold violation.
+    audit_sft_dataset(args.dataset, args.val_dataset)
 
     # Heavy imports are lazy so this module is importable without GPU deps.
     try:

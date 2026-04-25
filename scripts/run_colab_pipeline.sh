@@ -18,6 +18,12 @@ REPO_DIR="${REPO_DIR:-Meta_RL_Phase2}"
 GROUP="${GROUP:-qubit-medic-final}"
 EPISODES="${EPISODES:-1000}"
 SKIP_WANDB="${SKIP_WANDB:-0}"
+# Set to 1 when the caller (e.g. run_lightning_pipeline.sh) has already
+# installed a CUDA-matched torch + unsloth stack and we MUST NOT let
+# `pip install -r requirements-train.txt` re-resolve them (which would
+# pull a default-PyPI torch wheel and break GPU detection on driver-550
+# Lightning boxes).
+SKIP_PIP_INSTALL="${SKIP_PIP_INSTALL:-0}"
 
 if [[ ! -d "${REPO_DIR}" ]]; then
   git clone "${REPO_URL}" "${REPO_DIR}"
@@ -25,9 +31,13 @@ fi
 
 cd "${REPO_DIR}"
 
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-train.txt
+if [[ "${SKIP_PIP_INSTALL}" != "1" ]]; then
+  python -m pip install --upgrade pip
+  python -m pip install -r requirements.txt
+  python -m pip install -r requirements-train.txt
+else
+  echo "[colab-pipeline] SKIP_PIP_INSTALL=1 set; skipping pip install of requirements*.txt"
+fi
 
 if [[ "${SKIP_WANDB}" != "1" ]]; then
   wandb login
