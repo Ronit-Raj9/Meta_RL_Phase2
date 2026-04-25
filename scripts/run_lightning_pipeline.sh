@@ -49,6 +49,29 @@ if [[ "${SKIP_TORCH_INSTALL}" != "1" ]]; then
   echo "[lightning] upgrading pip"
   python -m pip install --upgrade pip
 
+  # Show what's currently installed so we can spot a mismatched CUDA build.
+  CURRENT_TORCH="$(python - <<'PY'
+try:
+    import torch
+    print(f"{torch.__version__}|{torch.version.cuda}|{torch.cuda.is_available()}")
+except Exception as exc:
+    print(f"none|none|{exc}")
+PY
+)"
+  echo "[lightning] currently installed torch: ${CURRENT_TORCH}  (version|runtime_cuda|cuda_available)"
+
+  # If torch is installed but cannot init CUDA OR was built against a CUDA
+  # the Lightning driver doesn't support, force-uninstall it before pulling
+  # the cu124 wheel. Without this, `pip install torch==X` from the cu124
+  # index is a no-op when pip thinks torch==X (any CUDA build) is already
+  # there -- which is exactly what trapped earlier runs of this script.
+  if [[ "${CURRENT_TORCH}" != none\|* ]]; then
+    if [[ "${CURRENT_TORCH}" != *\|True ]]; then
+      echo "[lightning] existing torch cannot init CUDA on this driver; uninstalling so we can replace it"
+      python -m pip uninstall -y torch torchvision torchaudio || true
+    fi
+  fi
+
   echo "[lightning] installing torch==${TORCH_VERSION}+${TORCH_CUDA} from PyTorch's CUDA-matched wheel index"
   echo "[lightning]   (Lightning Studios ship NVIDIA driver 550.x / CUDA 12.4;"
   echo "[lightning]    the default PyPI torch wheel needs driver 560+ and will not init CUDA)"
