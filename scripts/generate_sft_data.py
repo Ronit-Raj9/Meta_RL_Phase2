@@ -57,6 +57,35 @@ from qubit_medic.server.physics import (
 )
 
 
+# --------------------------------------------------------------------------- #
+# Reasoning-prefix helper                                                     #
+# --------------------------------------------------------------------------- #
+# The locked prompt (qubit_medic/prompts.py) tells the model to "Reason
+# briefly (1-2 sentences), then output your answer on the LAST line in this
+# EXACT format". A bare-format-line target contradicts that, so we emit a
+# 1-sentence template derived deterministically from (px, pz) and then the
+# canonical format line. Prompt and target now agree, eliminating the
+# oscillation that drove format_compliance from 0.54 -> 0.04 between
+# step 30 and step 50 of the original SFT run.
+
+
+def _build_reasoning(px: list[int], pz: list[int]) -> str:
+    """Deterministic 1-sentence reasoning that matches the format line."""
+    if not px and not pz:
+        return ("All stabilizer measurements report no detector firings, "
+                "indicating no data-qubit errors.")
+    if px and not pz:
+        ids = ", ".join(str(q) for q in sorted(set(px)))
+        return f"Z-stabilizer firings localize X-errors to qubit(s) {ids}."
+    if pz and not px:
+        ids = ", ".join(str(q) for q in sorted(set(pz)))
+        return f"X-stabilizer firings localize Z-errors to qubit(s) {ids}."
+    x_ids = ", ".join(str(q) for q in sorted(set(px)))
+    z_ids = ", ".join(str(q) for q in sorted(set(pz)))
+    return (f"X-stabilizer firings localize Z-errors to qubit(s) {z_ids}, "
+            f"and Z-stabilizer firings localize X-errors to qubit(s) {x_ids}.")
+
+
 # Locked curriculum mixture (master spec, section 1: SFT learns format
 # across the full distribution it will face during RL).
 LEVEL_MIX: list[tuple[str, float]] = [
@@ -102,6 +131,15 @@ def _build_caches() -> dict[str, dict]:
     return caches
 
 
+# Class-balance targets for SFT rejection sampling.
+# At p=0.001 / d=3, ~80% of natural draws have no errors. Training on that
+# distribution lets the model collapse to "always predict empty" and reach
+# ~0.20 loss without ever learning the format. We enforce ~70/30
+# non-trivial/trivial here so the cheap escape route is closed.
+TARGET_NONEMPTY_FRACTION: float = 0.70
+TRIVIAL_KEEP_PROB: float = 0.15  # keep ~15% of further trivial draws once at target
+
+
 def _generate_split(
     *,
     n: int,
@@ -110,15 +148,27 @@ def _generate_split(
     out_path: Path,
     rng: random.Random,
 ) -> tuple[int, int, int]:
-    """Generate ``n`` records to ``out_path``. Returns ``(n_written, n_syndrome, n_errors)``."""
+    """Generate ``n`` records to ``out_path``. Returns ``(n_written, n_syndrome, n_errors)``.
+
+    Uses class-balanced rejection sampling so non-trivial syndromes are
+    over-represented relative to the natural p=0.001 distribution. Each
+    completion is composed of a deterministic 1-sentence reasoning prefix
+    (see :func:`_build_reasoning`) followed by the canonical format line,
+    so prompt and target stay in agreement.
+    """
     written = n_with_syndrome = n_with_errors = 0
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    target_nonempty = int(round(n * TARGET_NONEMPTY_FRACTION))
+    target_empty = n - target_nonempty
+
+    shot = 0
     with out_path.open("w") as f:
-        for i in range(n):
+        while written < n:
+            shot += 1
             level_name = _pick_level(rng)
             cache = caches[level_name]
             layout = cache["layout"]
-            sampler = cache["circuit"].compile_detector_sampler(seed=seed + i + 1)
+            sampler = cache["circuit"].compile_detector_sampler(seed=seed + shot)
             det, obs = sampler.sample(1, separate_observables=True)
             det_row = det[0].astype(np.uint8)
 
@@ -133,6 +183,18 @@ def _generate_split(
             # LLM ID space (consecutive 0..N-1).
             px = layout.stim_to_llm(px_stim)
             pz = layout.stim_to_llm(pz_stim)
+            is_nonempty = bool(px or pz)
+
+            # Class-balance rejection: once we have enough trivial rows,
+            # reject most further trivial draws so non-trivial rows
+            # accumulate. Keep a small fraction of trivial draws so the
+            # model still sees clean "no errors" outputs.
+            empty_so_far = written - n_with_errors
+            if (not is_nonempty
+                    and empty_so_far >= target_empty
+                    and rng.random() > TRIVIAL_KEEP_PROB):
+                continue
+            # Surplus non-trivial rows are fine; no rejection on that side.
 
             prompt = build_prompt(
                 distance=cache["level"].distance,
@@ -143,7 +205,8 @@ def _generate_split(
                 num_z_stabilizers=cache["n_z_stab"],
                 num_data_qubits=layout.num_data_qubits,
             )
-            completion = format_completion(px, pz)
+            reasoning = _build_reasoning(px, pz)
+            completion = f"{reasoning} {format_completion(px, pz)}"
             record = {
                 "prompt": prompt,
                 "completion": completion,
