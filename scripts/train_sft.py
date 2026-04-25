@@ -552,8 +552,9 @@ def main(argv: Iterable[str] = ()) -> int:
                              "(SFT_EVAL_SCHEDULE) and fall back to "
                              "uniform --eval-every spacing")
     parser.add_argument("--print-sample-outputs", type=int,
-                        default=SFT_PRINT_SAMPLE_OUTPUTS,
-                        help="N raw model outputs to print + persist per eval")
+                        default=None,
+                        help="N raw model outputs to print + persist per eval "
+                             "(defaults to SFT_PRINT_SAMPLE_OUTPUTS from config)")
     parser.add_argument("--diversity-samples", type=int, default=10,
                         help="N samples for the output_diversity probe")
     parser.add_argument("--diversity-temperature", type=float, default=0.7)
@@ -594,6 +595,11 @@ def main(argv: Iterable[str] = ()) -> int:
     lora_alpha = args.lora_alpha if args.lora_alpha is not None else LORA_ALPHA
     lora_dropout = args.lora_dropout if args.lora_dropout is not None else LORA_DROPOUT
     eval_every = args.eval_every if args.eval_every is not None else SFT_EVAL_EVERY
+    print_sample_outputs = (
+        args.print_sample_outputs
+        if args.print_sample_outputs is not None
+        else SFT_PRINT_SAMPLE_OUTPUTS
+    )
     model_id = args.model if args.model else MODEL_ID
 
     random.seed(seed)
@@ -681,7 +687,7 @@ def main(argv: Iterable[str] = ()) -> int:
         "sft/train_dataset_size": len(train_dataset),
         "sft/val_dataset_size": len(val_records),
         "sft/first_text_len": len(train_dataset[0]["text"]),
-    }, step=0)
+    })
 
     # Dataset preview to W&B (sanity check the chat-template wrapping).
     wandb_utils.log_generation_table(
@@ -731,7 +737,7 @@ def main(argv: Iterable[str] = ()) -> int:
         val_records=val_records,
         eval_every=eval_every,
         eval_schedule=eval_schedule,
-        print_sample_outputs=args.print_sample_outputs,
+        print_sample_outputs=print_sample_outputs,
         output_dir=args.output,
         max_new_tokens=SFT_MAX_NEW_TOKENS,
         diversity_n_samples=args.diversity_samples,

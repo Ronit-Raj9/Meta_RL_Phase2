@@ -260,22 +260,12 @@ def run_context(run_name: str, job_type: str, **kwargs):
 
 def log(metrics: Mapping[str, Any], *, step: Optional[int] = None,
         commit: bool = True) -> None:
-    """No-op-safe ``wandb.log`` wrapper.
-
-    If ``step`` is set and the payload has no ``train/global_step`` key, we
-    add ``train/global_step: step`` so that metrics line up with workspace
-    panels that use the HuggingFace default (``train/global_step``) as the
-    global X axis. Without that, one-off SFT/RL scalars and tables appear
-    empty in those panels.
-    """
+    """No-op-safe ``wandb.log`` wrapper."""
     wandb = _import_wandb()
     if wandb is None or _RUN is None:
         return
     try:
-        payload = dict(metrics)
-        if step is not None and "train/global_step" not in payload:
-            payload["train/global_step"] = int(step)
-        wandb.log(payload, step=step, commit=commit)
+        wandb.log(dict(metrics), step=step, commit=commit)
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[wandb] log failed: {exc}", file=sys.stderr)
 
