@@ -17,7 +17,9 @@ dist/
 # Notebooks
 .ipynb_checkpoints/
 
-# Data + checkpoints
+# Data + LoRA/adapter checkpoints (large binaries; use Hugging Face Hub)
+checkpoints/
+
 data/sft_dataset.jsonl
 data/baseline_results.json
 data/willow_validation.json
