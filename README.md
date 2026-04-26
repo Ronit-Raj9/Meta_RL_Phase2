@@ -99,6 +99,40 @@ Held-out eval on 1000 episodes at L2_target (`data/eval_grpo.json`, source-of-tr
 
 ---
 
+## Reward Hacking — what we considered and what the function defends against
+
+GRPO optimises the policy directly against a scalar reward, so any gap between *"what the reward measures"* and *"what the task actually requires"* becomes a high-gradient attractor — the model collapses into the cheapest exploit the verifier cannot see. We listed the cheap exploits a 3B language model is most likely to find, then designed each reward channel so the exploit fails by construction.
+
+**The attacks we considered:**
+
+- **Empty Collapse** — the "always predict no errors" coward. Cheap, because at low noise rates most syndromes are trivially clean; if the verifier is symmetric, doing nothing is near-optimal.
+- **All-Qubits Flood** — flag every data qubit on every syndrome and hope the true ones are in there.
+- **Fixed-Qubit Guess** — lock onto a single qubit ID (e.g. centre qubit 4) and emit it for every prompt.
+- **PyMatching Mimicry** — copy the classical decoder verbatim. High logical-correction, zero learning beyond the baseline.
+- **Format Spam** — repeat the canonical answer line many times, hoping the parser scores the wrong copy.
+- **Out-of-Range Qubits** — emit qubit IDs the prompt never advertised (e.g. `99` on a `d=3` code).
+- **Verbose Ramble** — 500 tokens of impressive-sounding reasoning ending in a useless answer.
+- **Cosmetic Variants** — case changes, extra whitespace, line breaks inside brackets — anything that might fool a brittle regex.
+
+**How the reward function blocks each one:**
+
+| Attack | What kills it |
+|---|---|
+| Empty Collapse | The set-aware Jaccard rule scores **0.0** when truth is non-empty and prediction is empty (the "missed errors" case) — the empty answer earns no `hamming_overlap` on hard syndromes. The `syndrome_consistency` reward additionally caps at **0.5** when the prediction is empty AND the syndrome shows activity, so the collapse can never approach the full 1.0. |
+| All-Qubits Flood | Set-aware Jaccard penalises false alarms symmetrically: claiming every qubit gives `\|inter\|/\|union\|` ≈ 0 on small true sets. The implied Pauli frame typically flips the observable, so `logical_correction` collapses to 0 too. |
+| Fixed-Qubit Guess | A constant prediction agrees with a varying truth only by coincidence. `logical_correction` averages near random, `hamming_overlap` is poor, `pymatching_beat` is structurally 0. |
+| PyMatching Mimicry | `pymatching_beat` returns **0.0 by construction** whenever PyMatching is right — and PyMatching is right on most syndromes. The model can't earn the headline metric by imitating the baseline. |
+| Format Spam | The parser uses a **tail-anchored regex** (`...$` on rstripped output), so only the *last* `X_ERRORS=[...] Z_ERRORS=[...]` match in the completion is scored. Repetition reduces to the same content as a single line. |
+| Out-of-Range Qubits | The parser **validates every integer is in `[0, num_data_qubits)`** before populating the action. Out-of-range IDs set `parse_success=False`, which forces `format_compliance=0` and the action passed to physics has no support. |
+| Verbose Ramble | Same tail-anchored parser — verbose preface is invisible. The reward equals the bare-format submission. |
+| Cosmetic Variants | The parser is case-insensitive, tolerates spaces around `=` and inside brackets, and accepts newlines between the X and Z lists. This is robust parsing, not a hack — by design, syntactically equivalent answers score equivalently. |
+
+**The 5-component composition itself.** Reward components are *independent* by construction (each is a pure function of `(parsed_action, sample, layout)`; none observes another), so a single shortcut can't max out the total. The four "task" components are pulled toward 1.0 only when the prediction physically explains the syndrome AND preserves the logical observable; the fifth component (`pymatching_beat`) is structurally 0 unless the model genuinely outperforms the classical baseline. The total is then clamped to `[0, 1]` so no component can compensate for another beyond its weight.
+
+The full per-attack mathematical analysis, with source pointers for each defense, lives in [`docs/REWARD_HACKING.md`](docs/REWARD_HACKING.md). The short version: the reward function, by construction, demands real decoding.
+
+---
+
 ## Try it
 
 ```bash
