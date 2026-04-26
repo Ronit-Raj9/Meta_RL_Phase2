@@ -432,15 +432,17 @@ DEFAULT_PORT: int = 7860  # Hugging Face Spaces' default exposed port
 # all log to the same project / dashboard. Override per-run on the CLI.
 import os as _os  # noqa: E402  (local import to keep top of module clean)
 
-WANDB_PROJECT: str = _os.environ.get("WANDB_PROJECT", "QuantumScribe-GRPO")
+WANDB_PROJECT: str = _os.environ.get("WANDB_PROJECT", "QuantumScribe")
 """Default W&B project name. Override with ``WANDB_PROJECT=...``.
 
-Changed 2026-04 from ``"QuantumScribe"`` to ``"QuantumScribe-GRPO"`` per
-the GRPO spec rewrite. SFT runs that should land in the original project
-should set ``WANDB_PROJECT=QuantumScribe`` at the shell."""
+Reset 2026-04 (final-RL spec) from ``"QuantumScribe-GRPO"`` back to
+``"QuantumScribe"`` so SFT and GRPO runs land in the same project the
+operator monitors at wandb.ai/<entity>/QuantumScribe."""
 
-WANDB_ENTITY: str | None = _os.environ.get("WANDB_ENTITY", "ronitraj") or None
-"""W&B team or username. ``None`` -> wandb's default entity for the user."""
+WANDB_ENTITY: str | None = _os.environ.get("WANDB_ENTITY") or None
+"""W&B team or username. ``None`` -> wandb's default entity for the user
+(inferred from the API key written to ~/.netrc by ``wandb login``).
+Override explicitly with ``WANDB_ENTITY=...`` to write to a specific team."""
 
 WANDB_DEFAULT_TAGS: tuple[str, ...] = (
     "qubit-medic",
