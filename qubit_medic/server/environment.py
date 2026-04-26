@@ -229,7 +229,7 @@ class DecoderEnvironment:
                     syndrome_consistency=0.0,
                     hamming_overlap=0.0,
                     format_compliance=0.0,
-                    pymatching_beat=0.0,
+                    pymatching_margin=0.0,
                     total=0.0,
                 )
                 action = DecoderAction(

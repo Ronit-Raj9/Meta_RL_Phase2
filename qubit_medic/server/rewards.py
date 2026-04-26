@@ -233,26 +233,88 @@ def reward_format_compliance(parsed: ParseResult) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# Reward 5: PyMatching beat-rate bonus                                         #
+# Reward 5: PyMatching margin (CONTINUOUS — replaces the binary beat reward)   #
 # --------------------------------------------------------------------------- #
+#
+# 2026-04 final-RL spec rewrite. The previous binary reward_pymatching_beat
+# fired <5% of the time (only when PM was wrong AND model was right) and
+# gave essentially zero gradient on most prompts. The new margin reward fires
+# on EVERY prompt with a continuous value in [0, 1] centred at 0.5 (tied with
+# PyMatching). The model now has a clear gradient toward "do better than
+# PyMatching" on every single training example.
+#
+# Reward semantics:
+#     1.0 -- model decisively better than PyMatching
+#     0.5 -- tied with PyMatching (both right, or both equally wrong)
+#     0.0 -- model decisively worse than PyMatching
 
 
-def reward_pymatching_beat(
+def _residual_weight(
+    x_errors: list[int],
+    reference_x_errors: list[int],
+    d_code: int,
+) -> int:
+    """Symmetric-difference proxy for residual Pauli-frame weight, capped at
+    the code distance.
+
+    Exact "weight modulo stabilizers" is NP-hard in general; the symmetric
+    difference between two Pauli frames is a pessimistic upper bound that
+    correlates well in practice and is what the surrounding hamming_overlap
+    reward already uses.
+    """
+    sym_diff = set(x_errors) ^ set(reference_x_errors)
+    return min(len(sym_diff), d_code)
+
+
+def _code_distance_from_layout(layout: CircuitLayout) -> int:
+    """Recover the code distance d from layout. Rotated surface code has
+    d**2 data qubits, so d = round(sqrt(num_data_qubits))."""
+    n = max(1, int(layout.num_data_qubits))
+    d = int(round(n ** 0.5))
+    return max(1, d)
+
+
+def reward_pymatching_margin(
     parsed: ParseResult,
     sample: SyndromeSample,
     layout: CircuitLayout,
 ) -> float:
-    """1.0 iff PyMatching got this syndrome wrong AND the LLM got it right.
+    """Continuous margin reward in [0, 1].
 
-    This is the headline metric (Section 3.5). Most of training it'll be
-    near zero; the trajectory of its mean over steps is the proof we've
-    moved past pure imitation.
+    Implements the 2026-04 final-RL spec:
+
+        margin = pm_dist - model_dist           in [-d, +d]
+        reward = clip(0.5 + 0.5 * margin / d,   0, 1)
+
+    where ``*_dist`` is 0 when the predictor preserved the actual logical
+    observable, else the residual Pauli-frame weight (symmetric-difference
+    proxy, capped at d). PyMatching's "lost" case gets a fixed ``d``
+    penalty since we can't compute its own residual against itself.
     """
-    pm_correct = sample.pymatching_observable_pred == sample.actual_observable_flip
-    if pm_correct:
-        return 0.0
-    llm_implied = predicted_observable_flip(parsed.x_errors, layout)
-    return 1.0 if llm_implied == sample.actual_observable_flip else 0.0
+    d_code = _code_distance_from_layout(layout)
+
+    # Model: 0 if it preserved the observable, else residual vs PM frame.
+    model_implied = predicted_observable_flip(parsed.x_errors, layout)
+    model_correct = (model_implied == sample.actual_observable_flip)
+    if model_correct:
+        model_dist = 0
+    else:
+        model_dist = _residual_weight(
+            parsed.x_errors, sample.pymatching_x_errors, d_code,
+        )
+
+    # PyMatching: 0 if it preserved the observable, else d (max penalty).
+    pm_correct = (sample.pymatching_observable_pred == sample.actual_observable_flip)
+    pm_dist = 0 if pm_correct else d_code
+
+    raw_margin = pm_dist - model_dist  # in [-d, +d]
+    reward = 0.5 + 0.5 * (raw_margin / d_code)
+    return max(0.0, min(1.0, reward))
+
+
+# Back-compat alias so older imports of ``reward_pymatching_beat`` keep
+# resolving (they just now route to the continuous margin reward).
+reward_pymatching_beat = reward_pymatching_margin
 
 
 # --------------------------------------------------------------------------- #
@@ -262,13 +324,19 @@ def reward_pymatching_beat(
 
 @dataclass(frozen=True)
 class RewardBreakdown:
-    """Per-component scores plus the weighted total."""
+    """Per-component scores plus the weighted total.
+
+    The ``pymatching_margin`` field (2026-04 final-RL spec) replaces the
+    legacy binary ``pymatching_beat``. ``as_dict`` emits BOTH names so
+    older log readers and dashboard panels keep resolving while the
+    canonical key is now ``pymatching_margin``.
+    """
 
     logical_correction: float
     syndrome_consistency: float
     hamming_overlap: float
     format_compliance: float
-    pymatching_beat: float
+    pymatching_margin: float
     total: float
 
     def as_dict(self) -> dict[str, float]:
@@ -277,7 +345,9 @@ class RewardBreakdown:
             "syndrome_consistency": self.syndrome_consistency,
             "hamming_overlap": self.hamming_overlap,
             "format_compliance": self.format_compliance,
-            "pymatching_beat": self.pymatching_beat,
+            "pymatching_margin": self.pymatching_margin,
+            # Back-compat alias so older log panels keep working.
+            "pymatching_beat": self.pymatching_margin,
             "total": self.total,
         }
 
@@ -291,20 +361,22 @@ def compute_all_rewards(
 ) -> RewardBreakdown:
     """Compute all five rewards and the weighted total.
 
-    Returns a :class:`RewardBreakdown` whose ``as_dict`` is what the env's
-    ``info`` payload contains. The trainer logs each component separately.
+    Accepts either the new ``pymatching_margin`` weight key or the legacy
+    ``pymatching_beat`` key (the latter resolves to the same continuous
+    margin reward) so partial config rollbacks don't crash the trainer.
     """
     r1 = reward_logical_correction(parsed, sample, layout)
     r2 = reward_syndrome_consistency(parsed, sample, layout, final_detector_supports)
     r3 = reward_hamming_overlap(parsed, sample, layout)
     r4 = reward_format_compliance(parsed)
-    r5 = reward_pymatching_beat(parsed, sample, layout)
+    r5 = reward_pymatching_margin(parsed, sample, layout)
+    margin_weight = weights.get("pymatching_margin", weights.get("pymatching_beat", 0.0))
     total = (
         weights["logical_correction"] * r1
         + weights["syndrome_consistency"] * r2
         + weights["hamming_overlap"] * r3
         + weights["format_compliance"] * r4
-        + weights["pymatching_beat"] * r5
+        + margin_weight * r5
     )
     total = max(0.0, min(1.0, total))
     return RewardBreakdown(
@@ -312,6 +384,6 @@ def compute_all_rewards(
         syndrome_consistency=r2,
         hamming_overlap=r3,
         format_compliance=r4,
-        pymatching_beat=r5,
+        pymatching_margin=r5,
         total=total,
     )

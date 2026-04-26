@@ -144,11 +144,16 @@ CURRICULUM: tuple[CurriculumLevel, ...] = (
 # --------------------------------------------------------------------------- #
 
 REWARD_WEIGHTS: dict[str, float] = {
-    "logical_correction": 0.35,    # Reward 1 - the unfakeable ground truth
-    "hamming_overlap": 0.25,       # Reward 3 - dense partial credit
-    "syndrome_consistency": 0.20,  # Reward 2 - prevents lucky-guess attacks
-    "format_compliance": 0.10,     # Reward 4 - parser must succeed
-    "pymatching_beat": 0.10,       # Reward 5 - the headline metric
+    # 2026-04 final-RL spec (margin-reward rewrite). The headline metric
+    # (pymatching_margin) now carries 50% of the gradient because the
+    # binary pymatching_beat reward fired <5% of the time and gave no
+    # gradient on most prompts. Continuous margin in [0,1] (centered at
+    # 0.5 for "tied with PyMatching") provides signal on every prompt.
+    "logical_correction": 0.20,    # was 0.35; saturates once >= PyMatching
+    "hamming_overlap": 0.15,       # was 0.25; saturates once >= PyMatching
+    "syndrome_consistency": 0.10,  # was 0.20; flat once non-trivial
+    "format_compliance": 0.05,     # was 0.10; already at 0.95+
+    "pymatching_margin": 0.50,     # NEW; replaces pymatching_beat at 0.10
 }
 assert abs(sum(REWARD_WEIGHTS.values()) - 1.0) < 1e-9, "reward weights must sum to 1"
 
@@ -278,14 +283,36 @@ SFT_CHECKPOINT_PATH_FOR_GRPO: str = "checkpoints/sft_warmup/checkpoint-50"
 #   - lower KL coefficient (0.02) -> reward signal not dominated by KL drift
 #   - 1500 steps -> wall-clock fits the 13h cap with margin
 GRPO_STEPS: int = 1_500
-GRPO_GEN_PER_PROMPT: int = 4         # GRPO needs >=2 for advantage
+GRPO_GEN_PER_PROMPT: int = 8         # was 4; 8 keeps reward variance non-degenerate
+                                     # even when one or two completions collapse
 GRPO_BATCH_SIZE: int = 1             # per-device prompts per step
 GRPO_GRAD_ACCUM: int = 8             # effective batch = 8 prompts
 GRPO_LR: float = 2e-5                # bumped from 1e-5; reward signal is sparse
 GRPO_LR_SCHEDULER: str = "constant"  # no warmup, no decay
-GRPO_KL_COEF: float = 0.02           # half the TRL default; alarm if KL > 0.3
+GRPO_KL_COEF: float = 0.04           # was 0.02; doubled to keep policy honest
+                                     # under the new continuous margin reward
 GRPO_MAX_PROMPT_LEN: int = 1_500     # surface-code prompts can run long
-GRPO_MAX_COMPLETION_LEN: int = 50    # answer is one line: X_ERRORS=[..] Z_ERRORS=[..]
+GRPO_MAX_COMPLETION_LEN: int = 24    # was 50; tail past 24 tokens is garbage that
+                                     # was being optimised against during training
+GRPO_STOP_STRINGS: tuple[str, ...] = ("\n\n", "<|im_end|>", "<|endoftext|>")
+"""Stop-string set passed to the rollout generator so completions terminate at
+EOS / blank line instead of running to ``max_completion_length`` (which made
+clipped_ratio 1.0 and broke the train/eval policy match)."""
+
+# Filtered GRPO prompt pool (CHANGE 3): GRPO loads from this path instead of
+# data/sft_dataset.jsonl. The filter keeps only PyMatching-fallible prompts
+# (PM logical-error distance > 0) or multi-error syndromes (true_x|true_z >= 2),
+# concentrating GRPO compute on prompts with actual learning headroom.
+GRPO_PROMPT_POOL_PATH: str = "data/grpo_prompt_pool.jsonl"
+
+# Curriculum mix used for GRPO ROLLOUT prompts only (SFT mix unchanged).
+# 2026-04 final-RL spec: shift toward harder noise where MWPM breaks down
+# and beat-rate can fire.
+GRPO_CURRICULUM_MIX: dict[str, float] = {
+    "L1_warmup": 0.20,    # was 0.40
+    "L2_target": 0.50,    # unchanged
+    "L3_stretch": 0.30,   # was 0.10; tripled for beat-rate headroom
+}
 
 # ---- Diversity-focused rollout sampling (critical) ----------------------- #
 # These apply to GRPO ROLLOUT generation only. Eval uses temperature=0
@@ -298,19 +325,50 @@ GRPO_MAX_COMPLETION_LEN: int = 50    # answer is one line: X_ERRORS=[..] Z_ERROR
 #   * repetition_penalty=1.1 discourages the model from repeating the
 #     exact same byte sequence within a 4-completion group (reduces
 #     "all 4 generations identical" rate, which kills GRPO's gradient).
-GRPO_TEMPERATURE: float = 1.2
+GRPO_TEMPERATURE: float = 1.0       # was 1.2; this is now the STARTING value
+                                    # for the schedule below, not a constant
 GRPO_TOP_P: float = 0.95
 GRPO_TOP_K: int = 50
 GRPO_REPETITION_PENALTY: float = 1.1
 GRPO_DO_SAMPLE: bool = True
+
+# Linear temperature annealing schedule (replaces the prior auto-bump-on-
+# collapse band-aid that escalated to T=2.0 and produced incoherent rollouts).
+#   steps  0-300   : T = 1.0          (exploration phase)
+#   steps  300-1000: T = 1.0 -> 0.9   (linear, mid-training stabilisation)
+#   steps  1000+   : T = 0.9 -> 0.7   (linear, sharpening toward best policy)
+GRPO_TEMP_SCHEDULE: tuple[tuple[int, float], ...] = (
+    (0,    1.0),
+    (300,  1.0),
+    (1000, 0.9),
+    (1500, 0.7),
+)
+
+
+def temperature_at_step(step: int,
+                        schedule: tuple[tuple[int, float], ...] = GRPO_TEMP_SCHEDULE,
+                        ) -> float:
+    """Piecewise-linear interpolation over the GRPO temperature schedule."""
+    if step <= schedule[0][0]:
+        return schedule[0][1]
+    for (s0, t0), (s1, t1) in zip(schedule, schedule[1:]):
+        if s0 <= step <= s1:
+            if s1 == s0:
+                return t1
+            frac = (step - s0) / (s1 - s0)
+            return t0 + (t1 - t0) * frac
+    return schedule[-1][1]
 
 # ---- Checkpoint cadence + retention -------------------------------------- #
 GRPO_CHECKPOINT_EVERY: int = 100
 GRPO_SAVE_TOTAL_LIMIT: int = 3       # keep 3 most recent rolling checkpoints
 GRPO_LOG_EVERY: int = 5              # real-time visibility (every 5 steps)
 GRPO_OPTIMIZER: str = "adamw_8bit"
-GRPO_KL_ALARM: float = 0.3           # >this triggers manual triage
-GRPO_KL_HARD_CEIL: float = 0.5       # >this -> kill the run
+GRPO_KL_ALARM: float = 0.3           # informational only (no auto-action)
+GRPO_KL_HARD_CEIL: float = 0.5       # if sustained for GRPO_KL_HARD_CEIL_RUN_LEN
+                                     # steps, halve the LR (was: kill the run)
+GRPO_KL_HARD_CEIL_RUN_LEN: int = 5   # consecutive logged steps above the ceiling
+                                     # before the LR halves once
 
 # ---- Wall-clock safety --------------------------------------------------- #
 GRPO_WALL_SECONDS: float = 46_800.0   # 13 hours. Save+exit if exceeded.
@@ -334,8 +392,13 @@ GRPO_SAMPLE_LOG_N: int = 5
 # prompts collapsed, raise the rollout temperature by a fixed step.
 GRPO_INSPECTION_HOOK_EVERY: int = 100
 GRPO_INSPECTION_SAMPLE_N: int = 10
-GRPO_INSPECTION_COLLAPSE_THRESHOLD: int = 7  # "> 7 of 10"
-GRPO_TEMP_BUMP_ON_COLLAPSE: float = 0.2
+# 2026-04 final-RL spec (CHANGE 6): the inspection-hook auto-bump is
+# disabled. The previous version escalated temperature to 2.0, which
+# produced incoherent training rollouts and didn't translate to better
+# eval policies. Threshold > sample_n means the condition can never fire,
+# so the hook still LOGS uniqueness but never mutates temperature.
+GRPO_INSPECTION_COLLAPSE_THRESHOLD: int = 99
+GRPO_TEMP_BUMP_ON_COLLAPSE: float = 0.0
 
 # ---- Decision-rule thresholds (warnings only; no auto-action) ----------- #
 GRPO_DECISION_REWARD_STD_FLOOR: float = 0.03

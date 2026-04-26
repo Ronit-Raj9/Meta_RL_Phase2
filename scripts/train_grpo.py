@@ -1141,8 +1141,68 @@ def _build_wandb_callback(cache, model, tokenizer, env_client, eval_rows,
 # --------------------------------------------------------------------------- #
 
 
-def _build_prompt_pool(env_client, n: int):
-    prompts = []
+def _build_prompt_pool(env_client, n: int,
+                       *,
+                       pool_path: Optional[str] = None,
+                       curriculum_mix: Optional[dict] = None,
+                       rng_seed: int = 7):
+    """Build ``n`` GRPO rollout prompts.
+
+    Three modes (in priority order):
+
+      1. ``pool_path`` is given AND exists -> sample records from the
+         filtered pool, weighted by ``curriculum_mix`` per-level shares,
+         and reproduce each record's env state via ``reset(seed=, forced_level=)``.
+         This is the 2026-04 final-RL spec path (CHANGE 3 + 4).
+      2. ``curriculum_mix`` is given but ``pool_path`` is missing -> sample
+         level by mix, let the env generate a fresh syndrome.
+      3. Neither given -> fall back to the env's natural curriculum scheduler.
+    """
+    import random as _random
+
+    rng = _random.Random(rng_seed)
+    prompts: list[dict] = []
+
+    pool_records: Optional[dict[str, list[dict]]] = None
+    if pool_path:
+        from pathlib import Path as _P
+        pool_file = _P(pool_path)
+        if pool_file.exists():
+            buckets: dict[str, list[dict]] = {}
+            with pool_file.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    lvl = rec.get("level", "L2_target")
+                    buckets.setdefault(lvl, []).append(rec)
+            if buckets:
+                pool_records = buckets
+
+    if pool_records is not None and curriculum_mix:
+        # Mode 1: weighted draw from the filtered pool.
+        levels = [k for k in curriculum_mix.keys() if pool_records.get(k)]
+        weights = [curriculum_mix[k] for k in levels]
+        for _ in range(n):
+            level = rng.choices(levels, weights=weights, k=1)[0]
+            rec = rng.choice(pool_records[level])
+            seed = int(rec.get("seed", rng.randrange(1, 1_000_000)))
+            obs = env_client.reset(seed=seed, forced_level=level)
+            prompts.append({"prompt": obs.prompt, "episode_id": obs.episode_id})
+        return prompts
+
+    if curriculum_mix:
+        # Mode 2: weighted level sampling, env-generated syndrome.
+        levels = list(curriculum_mix.keys())
+        weights = list(curriculum_mix.values())
+        for _ in range(n):
+            level = rng.choices(levels, weights=weights, k=1)[0]
+            obs = env_client.reset(forced_level=level)
+            prompts.append({"prompt": obs.prompt, "episode_id": obs.episode_id})
+        return prompts
+
+    # Mode 3: fall through to the natural curriculum.
     for _ in range(n):
         obs = env_client.reset()
         prompts.append({"prompt": obs.prompt, "episode_id": obs.episode_id})
@@ -1321,8 +1381,18 @@ def main(argv: Iterable[str] = ()) -> int:
         print(f"[wandb] could not define x-axis metric: {exc!r}", file=sys.stderr)
 
     # ---- Build prompt pool -------------------------------------------- #
-    print(f"pre-generating {args.prompt_pool} prompts ...")
-    prompts = _build_prompt_pool(env_client, args.prompt_pool)
+    # 2026-04 final-RL spec: load from filtered pool + apply GRPO curriculum
+    # mix (CHANGES 3 + 4). Falls back to the env's natural sampler if the
+    # filtered file is missing.
+    from qubit_medic.config import GRPO_CURRICULUM_MIX, GRPO_PROMPT_POOL_PATH
+    print(f"pre-generating {args.prompt_pool} prompts "
+          f"(pool={GRPO_PROMPT_POOL_PATH}, mix={GRPO_CURRICULUM_MIX}) ...")
+    prompts = _build_prompt_pool(
+        env_client, args.prompt_pool,
+        pool_path=GRPO_PROMPT_POOL_PATH,
+        curriculum_mix=GRPO_CURRICULUM_MIX,
+        rng_seed=seed,
+    )
     dataset = Dataset.from_list(prompts)
     print(f"  built dataset with {len(dataset)} prompts")
 
@@ -1409,6 +1479,14 @@ def main(argv: Iterable[str] = ()) -> int:
         "top_k": GRPO_TOP_K,
         "repetition_penalty": GRPO_REPETITION_PENALTY,
     }
+    # 2026-04 final-RL spec (CHANGE 5): stop_strings clip the rollout at EOS
+    # so train- and eval-time policies match. Older TRL releases drop this
+    # via the kwarg-fallback below.
+    try:
+        from qubit_medic.config import GRPO_STOP_STRINGS
+        grpo_kwargs["stop_strings"] = list(GRPO_STOP_STRINGS)
+    except ImportError:
+        pass
 
     # Some TRL versions don't accept every sampling kwarg on GRPOConfig;
     # fall back gracefully so the script still runs.
@@ -1421,7 +1499,7 @@ def main(argv: Iterable[str] = ()) -> int:
             msg = str(exc)
             removed = False
             for k in ("repetition_penalty", "top_k", "top_p", "temperature",
-                      "save_only_model"):
+                      "stop_strings", "save_only_model"):
                 if k in msg and k in grpo_kwargs:
                     grpo_kwargs.pop(k)
                     dropped.append(k)

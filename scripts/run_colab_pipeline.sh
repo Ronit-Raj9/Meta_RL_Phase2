@@ -151,6 +151,20 @@ else
 fi
 
 # ------------------------------------------------------------------ #
+# 2026-04 final-RL spec (CHANGE 3): filter the SFT dataset down to
+# PyMatching-fallible prompts so GRPO compute is concentrated on
+# prompts with actual learning headroom.
+# ------------------------------------------------------------------ #
+if [[ ! -f "data/grpo_prompt_pool.jsonl" ]] || [[ "${FORCE_SFT}" == "1" ]]; then
+  echo "[colab-pipeline] filtering SFT dataset -> data/grpo_prompt_pool.jsonl"
+  python -m scripts.filter_prompt_pool \
+    --in data/sft_dataset.jsonl \
+    --out data/grpo_prompt_pool.jsonl
+else
+  echo "[colab-pipeline] data/grpo_prompt_pool.jsonl already exists; skipping filter (delete it or set FORCE_SFT=1 to redo)"
+fi
+
+# ------------------------------------------------------------------ #
 # Diversity preflight gate (2026-04 spec, FIX 2)
 # ------------------------------------------------------------------ #
 # Before letting GRPO touch the GPU, verify the SFT model still
@@ -195,16 +209,49 @@ if [[ "${PREFLIGHT_RC}" != "0" ]]; then
     exit 30
   fi
 fi
-echo "[colab-pipeline] diversity preflight PASSED; launching GRPO"
+echo "[colab-pipeline] diversity preflight PASSED"
 
+# ------------------------------------------------------------------ #
+# 2026-04 final-RL spec (CHANGE 9): GRPO pre-flight (6 checks) on the
+# new reward shape. Aborts if the new reward / weights / pool aren't
+# right BEFORE we burn GPU time on GRPO.
+# ------------------------------------------------------------------ #
+echo "[colab-pipeline] running GRPO pre-flight (new reward + filtered pool)"
+python -m scripts.preflight_grpo \
+  --pool data/grpo_prompt_pool.jsonl \
+  --adapter "${SFT_FOR_GRPO}"
+
+# ------------------------------------------------------------------ #
+# 2026-04 final-RL spec (CHANGE 10): 200-step GRPO mini-run gate.
+# Catches the failure mode at 12 minutes instead of 90. If GRPO_MINIRUN=0
+# the gate is skipped (e.g. for resuming a known-good config).
+# ------------------------------------------------------------------ #
+GRPO_MINIRUN="${GRPO_MINIRUN:-1}"
+GRPO_OUTPUT="${GRPO_OUTPUT:-checkpoints/grpo_v2}"
+
+if [[ "${GRPO_MINIRUN}" == "1" ]]; then
+  echo "[colab-pipeline] launching 200-step GRPO mini-run -> ${GRPO_OUTPUT}_minirun"
+  python -m scripts.train_grpo \
+    --sft-checkpoint "${SFT_FOR_GRPO}" \
+    --output "${GRPO_OUTPUT}_minirun" \
+    --steps 200 \
+    --report-to "${REPORT_TO}" \
+    --wandb-group "${GROUP}-minirun"
+  echo "[colab-pipeline] mini-run completed without crashes"
+  echo "[colab-pipeline]   inspect wandb metrics for clipped_ratio<0.20, pymatching_margin>0.55"
+  echo "[colab-pipeline]   reward_std_within_group>0.05, output_diversity>1.5, beat>0"
+  echo "[colab-pipeline]   then proceeding to full 1500-step run; set GRPO_MINIRUN=0 to skip next time"
+fi
+
+echo "[colab-pipeline] launching FULL GRPO run -> ${GRPO_OUTPUT}"
 python -m scripts.train_grpo \
   --sft-checkpoint "${SFT_FOR_GRPO}" \
-  --output checkpoints/grpo_final \
+  --output "${GRPO_OUTPUT}" \
   --report-to "${REPORT_TO}" \
   --wandb-group "${GROUP}"
 
 python -m scripts.eval \
-  --adapter checkpoints/grpo_final \
+  --adapter "${GRPO_OUTPUT}" \
   --episodes "${EPISODES}" \
   --out data/eval_grpo.json
 
