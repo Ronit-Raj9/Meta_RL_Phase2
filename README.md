@@ -87,9 +87,45 @@ python -m scripts.eval --adapter /path/to/grpo/adapter --episodes 1000 --out dat
 
 ---
 
+## Data in `data/`
+
+| File | Purpose |
+|------|--------|
+| [data/eval_grpo.json](data/eval_grpo.json) | **Primary eval** — single JSON summary (episodes, `logical_correction_rate`, `pymatching_beat_rate`, overlaps, `level`, etc.) from `scripts.eval`. |
+| [data/grpo_validation.jsonl](data/grpo_validation.jsonl) | GRPO **validation** prompts / episodes (one JSON object per line; curriculum, syndrome, seeds). |
+| [data/sft_dataset_analysis.json](data/sft_dataset_analysis.json) | **SFT dataset report** — stats (completion lengths, level mix, train/val overlap, `eval_windows`). |
+| [data/sft_validation.jsonl](data/sft_validation.jsonl) | SFT **held-out** set used during training. |
+| [data/sft_dataset_sample.jsonl](data/sft_dataset_sample.jsonl) | Small **sample** of SFT training rows (prompt + metadata). |
+
+Generated on demand (not always committed) after `make baselines` / SFT / Willow runs, per [.gitignore](.gitignore):
+
+- `data/baseline_results.json` — random / zeros / PyMatching baselines  
+- `data/sft_dataset.jsonl` — full SFT train (from `make sft-data` or `generate_sft_data`)  
+- `data/willow_validation.json`, `data/willow_d3.dem` — cross-distribution checks  
+
+---
+
 ## Figures in `figures/`
 
-[figures/FIGURES.md](figures/FIGURES.md) documents provenance. The **trajectory** PNGs (`total_reward.png`, `logical_correction.png`, `pymatching_beat_rate.png`) are **illustrative** (synthetic from baselines), not automatic exports from a specific W&B run. To replace them with real curves, use `scripts/plot_results.py` and your run logs (see the script and `FIGURES.md`).
+Provenance and regeneration: [figures/FIGURES.md](figures/FIGURES.md). The three **trajectory** plots below are **illustrative** (from `make plots` / baseline-anchored synthetic mode), not a raw W&B export—replace with `scripts/plot_results.py` and real logs when you have them.
+
+**Training trajectories (illustrative)**
+
+| Mean episode reward | Logical correction rate | PyMatching beat rate |
+|:-:|:-:|:-:|
+| ![Total reward](figures/total_reward.png) | ![Logical correction](figures/logical_correction.png) | ![PyMatching beat](figures/pymatching_beat_rate.png) |
+
+**Grid animation** (Stim + layout demo)
+
+![Surface-code grid animation](figures/grid_animation.gif)
+
+**Reward & metrics from data (reproducible)** — not time-series; single-run summaries from [data/eval_grpo.json](data/eval_grpo.json) and [data/sft_dataset_analysis.json](data/sft_dataset_analysis.json). Regenerate: `python -m scripts.plot_data_figures`
+
+| Eval metrics (held-out) | SFT curriculum mix (train split) |
+|:-:|:-:|
+| ![Eval metrics bars](figures/eval_metrics_bars.png) | ![SFT curriculum mix](figures/sft_curriculum_mix.png) |
+
+*Note:* For **per-reward time series** and KL during GRPO, use the W&B run ([project `QuantumScribe-GRPO`](https://wandb.ai/ronitraj))—panels like `rl/reward/total_mean`, `rl/reward/logical_correction_mean`, etc.
 
 ---
 
@@ -257,7 +293,7 @@ qubit_medic/
   server/   (app, environment, rewards, curriculum, physics, openenv_adapter)
 scripts/
   validate_env.py, generate_sft_data.py, train_sft.py, train_grpo.py, eval.py
-  baseline_policies.py, plot_results.py, animate_grid.py, willow_validation.py
+  baseline_policies.py, plot_results.py, plot_data_figures.py, animate_grid.py, willow_validation.py
   format_test.py, diversity_preflight.py, deploy_to_space.py, sync_kaggle_bundle.py
 tests/     data/     figures/     checkpoints/     notebooks/colab_train.ipynb
 app_gradio.py   Dockerfile   openenv.yaml   Makefile
