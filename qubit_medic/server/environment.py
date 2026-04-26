@@ -201,9 +201,17 @@ class DecoderEnvironment:
         with self._lock:
             episode = self._active.pop(episode_id, None)
             if episode is None:
-                # Calling step() on an unknown episode ID is a hard error -
-                # the trainer didn't follow reset/step pairing.
-                raise KeyError(f"unknown or already-finished episode {episode_id}")
+                # Calling step() on an unknown episode ID is a clean
+                # ValueError (compliance Section 1 of the participant-guide
+                # audit: the env must "raise a clean ValueError, not a
+                # Python traceback"). The trainer didn't follow reset/step
+                # pairing, or the episode already ended; either way we
+                # surface a typed exception so the FastAPI layer can turn
+                # it into a 400 response instead of a 500.
+                raise ValueError(
+                    f"unknown or already-finished episode {episode_id}; "
+                    f"call reset() before step()."
+                )
 
             elapsed = time.monotonic() - episode.started_at
             timed_out = elapsed > EPISODE_TIMEOUT_SECONDS
@@ -312,3 +320,36 @@ class DecoderEnvironment:
                 "curriculum": self._scheduler.stats(),
                 "cached_levels": list(self._caches.keys()),
             }
+
+    def state(self) -> dict:
+        """Return a JSON-serialisable snapshot of the env's externally-
+        visible state (compliance Section 1 of the participant-guide
+        audit: ``state()`` returns a JSON-serialisable object, not a raw
+        Python object).
+
+        Crucially this never includes the ground-truth fields stored on
+        the per-episode :class:`DecoderState` (true error patterns,
+        actual_observable_flip, pymatching_observable_pred, circuit_text,
+        dem_text). Those stay in ``self._active[ep].state`` and are only
+        consumed by the reward functions.
+        """
+        with self._lock:
+            return {
+                "episodes_started": int(self._episode_counter),
+                "active_episodes": int(len(self._active)),
+                "active_episode_ids": [int(ep) for ep in self._active.keys()],
+                "cached_levels": list(self._caches.keys()),
+                "curriculum": self._scheduler.stats(),
+                "base_seed": int(self._base_seed),
+            }
+
+    def close(self) -> None:
+        """Drop any in-flight episodes and clear caches.
+
+        Compliance Section 1: the gym-style API requires ``close()``.
+        After ``close()`` the env can still be re-used by calling
+        ``reset()`` again - we don't tear down the curriculum scheduler
+        or release the lock; we only release per-episode bookkeeping.
+        """
+        with self._lock:
+            self._active.clear()

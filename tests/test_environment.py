@@ -35,8 +35,10 @@ def test_local_reset_step_pairs():
 
 
 def test_step_unknown_episode_raises():
+    # Compliance Section 1 (audit, 2026-04): step() on an unknown episode
+    # ID must raise a clean ValueError, not a KeyError-Python-traceback.
     client = LocalDecoderClient()
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError):
         client.step(raw_response="X_ERRORS=[] Z_ERRORS=[]", episode_id=10**9)
 
 

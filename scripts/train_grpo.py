@@ -634,6 +634,29 @@ def _build_wandb_callback(cache, model, tokenizer, env_client, eval_rows,
                     }, step=step)
                 state["step50_warned"] = True
 
+            # Compliance Section 8 (audit, 2026-04): continuous warning
+            # for reward_std < 0.02 at ANY step, not only step 50. We
+            # throttle to once per 100 steps so the message doesn't
+            # spam every 5-step log line. The existing step-50 gate
+            # above stays as the harder "pause for review" check at
+            # the higher 0.03 threshold; this continuous one fires
+            # earlier the moment within-group variance crosses the
+            # spec floor and tells the operator to look at the run.
+            CONT_REWARD_STD_FLOOR = 0.02
+            if mean_within_std < CONT_REWARD_STD_FLOOR:
+                last_warn = state.get("reward_std_warned_at", -1)
+                if step - last_warn >= 100:
+                    print(f"\n[grpo-warn] @ step {step}: "
+                          f"train/reward_std_within_group="
+                          f"{mean_within_std:.4f} < {CONT_REWARD_STD_FLOOR} "
+                          f"(continuous alarm). GRPO advantage signal is "
+                          f"vanishing - inspect generations / temperature.")
+                    wandb_utils.log({
+                        "alarms/reward_std_continuous_low": 1.0,
+                        "alarms/reward_std_value": mean_within_std,
+                    }, step=step)
+                    state["reward_std_warned_at"] = step
+
             # ----- Mode-collapse inspection hook ----- #
             for u in uniques:
                 recent_uniques.append(u)

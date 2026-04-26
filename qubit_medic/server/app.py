@@ -79,6 +79,41 @@ def _get_legacy_env() -> DecoderEnvironment:
     return _legacy_env
 
 
+# --------------------------------------------------------------------------- #
+# Compliance Section 2 (audit 2026-04): POST /state and POST /close.          #
+# --------------------------------------------------------------------------- #
+# OpenEnv's create_fastapi_app already mounts GET /state and (via the
+# canonical contract) does not expose /close at all. The participant-guide
+# audit explicitly requires POST /state and POST /close, so we surface
+# both as additional routes that delegate to the legacy DecoderEnvironment
+# singleton (the same one /decode already uses). The OpenEnv-canonical
+# GET /state route is preserved untouched.
+# --------------------------------------------------------------------------- #
+
+
+@app.post("/state")
+def post_state() -> dict:
+    """POST mirror of the OpenEnv GET /state route.
+
+    Returns a JSON-serialisable snapshot of env state. Uses the inner
+    :meth:`DecoderEnvironment.state` (added in Section 1 compliance work)
+    which excludes ground-truth fields by construction.
+    """
+    return _get_legacy_env().state()
+
+
+@app.post("/close")
+def post_close() -> dict:
+    """POST /close: drop in-flight episodes on the legacy env singleton.
+
+    The singleton is rebuilt lazily on the next /reset, so calling /close
+    repeatedly is idempotent. Returns a small JSON dict so the caller can
+    confirm the request landed.
+    """
+    _get_legacy_env().close()
+    return {"ok": True, "closed": True}
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     """Lightweight liveness probe (Day-0 deployment-substrate test).
