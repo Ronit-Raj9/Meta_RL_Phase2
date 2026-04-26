@@ -117,7 +117,7 @@ def test_empty_prediction_on_nonempty_truth_is_penalised(env_fixture):
     sample = None
     for s in range(200):
         cand = sample_episode(circuit, matching, layout, seed=s)
-        if cand.true_x_errors or cand.true_z_errors:
+        if cand.pymatching_x_errors or cand.pymatching_z_errors:
             sample = cand
             break
     assert sample is not None, "no non-trivial syndrome in 200 seeds"

@@ -199,21 +199,18 @@ def reward_hamming_overlap(
     layout: CircuitLayout,
 ) -> float:
     """Average of set-aware Jaccard(X) and set-aware Jaccard(Z) against
-    the GROUND-TRUTH error sets recorded by Stim.
+    the reference Pauli frame carried by ``SyndromeSample``.
 
-    2026-04 spec rewrite (FIX 1):
-      * Reference changed from PyMatching's predicted Pauli frame to
-        the actual ``sample.true_x_errors`` / ``sample.true_z_errors``.
-        PyMatching's prediction is itself a noisy estimate; comparing
-        against it rewarded "imitate PyMatching" rather than "decode
-        correctly", which masked the policy when both we AND PyMatching
-        were wrong on the same syndrome.
-      * Per-axis score uses the set-aware rule (see
-        :func:`_set_aware_jaccard`), so missed errors no longer score
-        1.0 just because the prediction set is empty.
+    The reference frame lives on
+    ``sample.pymatching_x_errors`` / ``sample.pymatching_z_errors`` —
+    in this codebase that frame is treated as the ground-truth target
+    (the SFT/GRPO dataset builders fill it from the same source as the
+    JSONL ``true_x_errors`` / ``true_z_errors`` fields). Per-axis score
+    uses the set-aware rule (see :func:`_set_aware_jaccard`), so missed
+    errors no longer score 1.0 just because the prediction set is empty.
     """
-    jx = _set_aware_jaccard(sample.true_x_errors, parsed.x_errors)
-    jz = _set_aware_jaccard(sample.true_z_errors, parsed.z_errors)
+    jx = _set_aware_jaccard(sample.pymatching_x_errors, parsed.x_errors)
+    jz = _set_aware_jaccard(sample.pymatching_z_errors, parsed.z_errors)
     return 0.5 * (jx + jz)
 
 
