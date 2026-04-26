@@ -1,5 +1,5 @@
 ---
-title: Qubit-Medic
+title: QuantumScribe
 emoji: 🩺
 colorFrom: indigo
 colorTo: pink
@@ -19,7 +19,7 @@ license: mit
 short_description: OpenEnv RL env that teaches an LLM to decode quantum errors.
 ---
 
-# Qubit-Medic: An LLM Decoder for Quantum Error Correction
+# QuantumScribe: An LLM Decoder for Quantum Error Correction
 
 An LLM (Qwen2.5-3B-Instruct) learning to outperform a 50-year-old graph-matching algorithm (PyMatching) at decoding quantum surface-code syndromes — using verifiable physics rewards, not human preferences. DeepMind's AlphaQubit (*Nature* 2024, Bausch et al.) showed a transformer can beat strong classical decoders, but it cost Google millions of dollars and a custom architecture. We ship a 3B-parameter open model on a free Colab T4, trained with SFT + GRPO against a real Stim simulator behind an OpenEnv HTTP contract.
 

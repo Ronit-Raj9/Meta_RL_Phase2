@@ -1,6 +1,6 @@
 # Environment API
 
-Qubit-Medic exposes an OpenEnv-compliant HTTP server built on top of
+QuantumScribe exposes an OpenEnv-compliant HTTP server built on top of
 `openenv.core.create_fastapi_app`. The server wraps an internal
 `DecoderEnvironment` (Stim + PyMatching) through the standard
 `Action` / `Observation` / `State` Pydantic shapes.
