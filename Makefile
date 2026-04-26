@@ -72,7 +72,7 @@ train-sft:
 train-grpo:
 	$(PY) -m scripts.train_grpo --report-to wandb \
 	    --wandb-group $(GROUP) \
-	    --sft-checkpoint checkpoints/sft_warmup \
+	    --sft-checkpoint checkpoints/sft_warmup/checkpoint-50 \
 	    --output checkpoints/grpo
 
 eval:

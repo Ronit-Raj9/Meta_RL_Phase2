@@ -233,6 +233,11 @@ SFT_EARLY_STOP_CORRECTION: float = 0.80
 SFT_EARLY_STOP_DIVERSITY: int = 3
 SFT_MAX_WALL_SECONDS: float = 30 * 60.0  # 30-minute hard ceiling
 
+# HuggingFace Trainer subfolder (step-50 save) used to initialise GRPO.
+# ``python -m scripts.train_grpo`` defaults to this path; pipeline scripts
+# also pass it explicitly.
+SFT_CHECKPOINT_PATH_FOR_GRPO: str = "checkpoints/sft_warmup/checkpoint-50"
+
 # ---- GRPO RL phase (master spec, section 5) ------------------------------ #
 GRPO_STEPS: int = 2_000
 GRPO_GEN_PER_PROMPT: int = 4         # GRPO needs >=2 for advantage

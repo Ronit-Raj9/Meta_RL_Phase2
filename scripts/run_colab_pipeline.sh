@@ -12,12 +12,19 @@ set -euo pipefail
 #   GROUP      (default: qubit-medic-final)
 #   EPISODES   (default: 1000)
 #   SKIP_WANDB (set to 1 to disable wandb login prompt/reporting)
+#   SFT_FOR_GRPO  (default: checkpoints/sft_warmup/checkpoint-50) — SFT
+#            snapshot for GRPO init. If this directory exists and
+#            FORCE_SFT=0, generate_sft_data and train_sft are skipped.
+#   FORCE_SFT  (default: 0) — if 1, always run SFT first.
 
 REPO_URL="${REPO_URL:-https://github.com/Ronit-Raj9/Meta_RL_Phase2.git}"
 REPO_DIR="${REPO_DIR:-Meta_RL_Phase2}"
 GROUP="${GROUP:-qubit-medic-final}"
 EPISODES="${EPISODES:-1000}"
 SKIP_WANDB="${SKIP_WANDB:-0}"
+# Step-50 LoRA in repo is the default GRPO initialisation (see config.SFT_CHECKPOINT_PATH_FOR_GRPO).
+SFT_FOR_GRPO="${SFT_FOR_GRPO:-checkpoints/sft_warmup/checkpoint-50}"
+FORCE_SFT="${FORCE_SFT:-0}"
 # Set to 1 when the caller (e.g. run_lightning_pipeline.sh) has already
 # installed a CUDA-matched torch + unsloth stack and we MUST NOT let
 # `pip install -r requirements-train.txt` re-resolve them (which would
@@ -111,17 +118,20 @@ else
   REPORT_TO="none"
 fi
 
-python -m scripts.generate_sft_data
-
-python -m scripts.train_sft \
-  --dataset data/sft_dataset.jsonl \
-  --val-dataset data/sft_validation.jsonl \
-  --output checkpoints/sft_warmup \
-  --report-to "${REPORT_TO}" \
-  --wandb-group "${GROUP}"
+if [[ "${FORCE_SFT}" == "1" ]] || [[ ! -d "${SFT_FOR_GRPO}" ]]; then
+  python -m scripts.generate_sft_data
+  python -m scripts.train_sft \
+    --dataset data/sft_dataset.jsonl \
+    --val-dataset data/sft_validation.jsonl \
+    --output checkpoints/sft_warmup \
+    --report-to "${REPORT_TO}" \
+    --wandb-group "${GROUP}"
+else
+  echo "[colab-pipeline] found ${SFT_FOR_GRPO}; skipping generate_sft_data and train_sft (FORCE_SFT=1 to run SFT anyway)"
+fi
 
 python -m scripts.train_grpo \
-  --sft-checkpoint checkpoints/sft_warmup \
+  --sft-checkpoint "${SFT_FOR_GRPO}" \
   --output checkpoints/grpo_final \
   --report-to "${REPORT_TO}" \
   --wandb-group "${GROUP}"

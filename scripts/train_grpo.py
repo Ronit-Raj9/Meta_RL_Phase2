@@ -25,7 +25,7 @@ Locked hyperparameters (master spec, section 5):
 Usage::
 
     python -m scripts.train_grpo \
-        --sft-checkpoint checkpoints/sft_warmup \
+        --sft-checkpoint checkpoints/sft_warmup/checkpoint-50 \
         --output checkpoints/grpo \
         --steps 2000 \
         --report-to wandb
@@ -80,6 +80,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+from qubit_medic.config import SFT_CHECKPOINT_PATH_FOR_GRPO
 
 # --------------------------------------------------------------------------- #
 # Pre-flight: detect the unsloth / unsloth_zoo signature skew that crashes    #
@@ -155,7 +156,8 @@ def _assert_grpo_signature_compatible() -> None:
         "      && rm -rf unsloth_compiled_cache",
         "",
         "  Then re-run:",
-        "    python -m scripts.train_grpo --sft-checkpoint checkpoints/sft_warmup \\",
+        "    python -m scripts.train_grpo --sft-checkpoint "
+        "checkpoints/sft_warmup/checkpoint-50 \\",
         "        --output checkpoints/grpo_final",
         "=" * 78,
         "",
@@ -618,7 +620,12 @@ def _build_prompt_pool(env_client, n: int):
 
 def main(argv: Iterable[str] = ()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sft-checkpoint", type=str, default="checkpoints/sft_warmup")
+    parser.add_argument(
+        "--sft-checkpoint",
+        type=str,
+        default=SFT_CHECKPOINT_PATH_FOR_GRPO,
+        help="HF save dir (e.g. step-50 LoRA). Default: config SFT_CHECKPOINT_PATH_FOR_GRPO",
+    )
     parser.add_argument("--output", type=str, default="checkpoints/grpo")
     parser.add_argument("--model", type=str,
                         default=os.getenv("QUBIT_MEDIC_MODEL", "Qwen/Qwen2.5-3B-Instruct"))
