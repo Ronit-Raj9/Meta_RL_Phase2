@@ -41,6 +41,8 @@ An LLM (Qwen2.5-3B-Instruct) learning to outperform a 50-year-old graph-matching
 
 The agent observes a **surface-code syndrome** (detector parities from a `surface_code:rotated_memory_z` Stim circuit) and must emit a **Pauli frame** that preserves the encoded logical Z observable. Episodes are single-step: one syndrome in, one parseable correction out, scored by Stim's real physics — not a learned reward model. Across the curriculum, the policy moves from clean distance-3 codes to noisier multi-round circuits where PyMatching starts to fail.
 
+We generate synthetic surface-code syndromes using **Stim** ([Gidney 2021](https://arxiv.org/abs/2103.02202)), the same Clifford simulator used by the AlphaQubit and Willow papers. This ensures our training data is drawn from the same physical model as the published benchmarks — not a homemade simulator.
+
 ![Surface-code grid animation](figures/grid_animation.gif)
 
 ## Environment
@@ -383,6 +385,16 @@ app_gradio.py   Dockerfile   openenv.yaml   Makefile
 ## Citations
 
 ```bibtex
+@article{gidney_stim_2021,
+  title   = {Stim: a fast stabilizer circuit simulator},
+  author  = {Gidney, Craig},
+  journal = {Quantum},
+  volume  = {5},
+  pages   = {497},
+  year    = {2021},
+  doi     = {10.22331/q-2021-07-06-497},
+  note    = {arXiv:2103.02202}
+}
 @article{bausch_alphaqubit_2024,
   title   = {Learning high-accuracy error decoding for quantum processors},
   author  = {Bausch, Johannes and others},

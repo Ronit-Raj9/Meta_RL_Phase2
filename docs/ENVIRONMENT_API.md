@@ -5,6 +5,14 @@ Qubit-Medic exposes an OpenEnv-compliant HTTP server built on top of
 `DecoderEnvironment` (Stim + PyMatching) through the standard
 `Action` / `Observation` / `State` Pydantic shapes.
 
+> **Simulation substrate.** Surface-code syndromes are generated with
+> **Stim** ([Gidney 2021](https://arxiv.org/abs/2103.02202), *Quantum*
+> 5:497), the field-standard Clifford simulator for quantum error
+> correction. This is the same simulation engine used by AlphaQubit
+> (Bausch et al., *Nature* 2024) and Willow (Acharya et al., 2024) —
+> training data is drawn from the same physical model as the published
+> benchmarks, not a homemade simulator.
+
 Source files:
 
 - `qubit_medic/server/openenv_adapter.py`

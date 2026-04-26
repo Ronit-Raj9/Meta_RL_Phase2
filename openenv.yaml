@@ -96,6 +96,16 @@ curriculum:
     promotion_threshold: 0.30
 
 citations:
+  - gidney_stim_2021:
+      title: "Stim: a fast stabilizer circuit simulator"
+      authors: Gidney, Craig
+      venue: Quantum 5:497
+      doi: 10.22331/q-2021-07-06-497
+      arxiv: 2103.02202
+      note: |
+        Field-standard Clifford simulator for quantum error correction.
+        Same simulation substrate used by AlphaQubit (Bausch 2024) and
+        Willow (Acharya 2024); not a homemade simulator.
   - bausch_alphaqubit_2024:
       title: Learning high-accuracy error decoding for quantum processors
       authors: Bausch et al.
