@@ -44,6 +44,8 @@ def _summary(name: str, level: str, results: list[dict],
     """Same metric set as scripts.eval._summary so comparison_table can
     consume it without modification, plus a few HTTP-specific extras."""
     n = max(1, len(results))
+    hard = [r for r in results if int(r.get("n_true_errors", 0)) >= 2]
+    n_hard = len(hard)
     return {
         "name": name,
         "level": level,
@@ -69,6 +71,14 @@ def _summary(name: str, level: str, results: list[dict],
             sum(int(r.get("exact_match_pymatching", 0)) for r in results) / n,
         "mean_output_length":
             sum(int(r.get("output_length", 0)) for r in results) / n,
+        # Hard-syndrome subset (FIX 5, 2026-04 eval spec).
+        "hard_syndrome_count": n_hard,
+        "hard_syndrome_lcr":
+            (sum(r["logical_correction"] >= 0.5 for r in hard) / n_hard
+             if n_hard else 0.0),
+        "hard_syndrome_beat_rate":
+            (sum(r["pymatching_beat"] >= 0.5 for r in hard) / n_hard
+             if n_hard else 0.0),
         "elapsed_seconds": round(elapsed_s, 3),
         "throughput_ep_per_s": round(n / max(elapsed_s, 1e-6), 3),
     }
@@ -99,6 +109,11 @@ def _run_one(client: DecoderClient, policy_name: str, level: str,
             # PyMatching imitator decodes from the same baseline we score
             # against, so it trivially exact-matches by construction.
             rwd["exact_match_pymatching"] = 1
+        # Tag with true-error count so _summary can filter the hard subset.
+        rwd["n_true_errors"] = (
+            len(result.info.get("pymatching_x_errors", []) or [])
+            + len(result.info.get("pymatching_z_errors", []) or [])
+        )
         rewards.append(rwd)
         if (ep + 1) % 25 == 0:
             print(f"  [{policy_name:<10} {level:<10}] {ep + 1}/{episodes} done",

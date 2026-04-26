@@ -136,6 +136,27 @@ CURRICULUM: tuple[CurriculumLevel, ...] = (
         promotion_threshold=0.30,  # stretch goal - even partial counts
         eval_size=200,
     ),
+    # 2026-04 evaluation-only stress level. Same geometry as L3 but 5x the
+    # noise rate so:
+    #   * zeros policy drops to ~50-60% LCR
+    #   * pymatching drops to ~80-90% LCR
+    # leaving real headroom for trained-model differentiation. NOT used
+    # during training (curriculum scheduler ignores it because it isn't
+    # in the SFT/GRPO mixes); only invoked via --level L4_stress on
+    # scripts/eval.py and scripts/eval_remote.py.
+    #
+    # NOTE: the deployed HF Space (the canonical remote /reset target)
+    # was built before this level existed. Remote eval against the Space
+    # for this level will fail until the Space container is rebuilt; run
+    # locally via `python -m scripts.eval --level L4_stress ...` instead.
+    CurriculumLevel(
+        name="L4_stress",
+        distance=DISTANCE_STRETCH,
+        rounds=DISTANCE_STRETCH,
+        p=0.005,
+        promotion_threshold=0.20,  # eval-only; promotion never triggered
+        eval_size=200,
+    ),
 )
 
 
