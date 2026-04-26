@@ -12,9 +12,16 @@ set -euo pipefail
 #   GROUP      (default: qubit-medic-final)
 #   EPISODES   (default: 1000)
 #   SKIP_WANDB (set to 1 to disable wandb login prompt/reporting)
-#   SFT_FOR_GRPO  (default: checkpoints/sft_warmup/checkpoint-50) — SFT
-#            snapshot for GRPO init. If this directory exists and
-#            FORCE_SFT=0, generate_sft_data and train_sft are skipped.
+#   SFT_FOR_GRPO  (default: checkpoints/sft_warmup) — SFT snapshot
+#            for GRPO init. Points at the ROLLING save dir (the
+#            latest adapter weights produced by train_sft.py) rather
+#            than a step-pinned sub-checkpoint, because the 2026-04
+#            diversity-collapse early stop can halt SFT before
+#            step 50 and there is no longer a guarantee that
+#            checkpoint-50 exists. The rolling dir always has the
+#            most-recent weights regardless of what step SFT
+#            stopped at. If this directory exists and FORCE_SFT=0,
+#            generate_sft_data and train_sft are skipped.
 #   FORCE_SFT  (default: 0) — if 1, always run SFT first.
 
 REPO_URL="${REPO_URL:-https://github.com/Ronit-Raj9/Meta_RL_Phase2.git}"
@@ -22,8 +29,13 @@ REPO_DIR="${REPO_DIR:-Meta_RL_Phase2}"
 GROUP="${GROUP:-qubit-medic-final}"
 EPISODES="${EPISODES:-1000}"
 SKIP_WANDB="${SKIP_WANDB:-0}"
-# Step-50 LoRA in repo is the default GRPO initialisation (see config.SFT_CHECKPOINT_PATH_FOR_GRPO).
-SFT_FOR_GRPO="${SFT_FOR_GRPO:-checkpoints/sft_warmup/checkpoint-50}"
+# 2026-04: rolling save dir is the canonical "current SFT adapter"
+# reference. Was checkpoints/sft_warmup/checkpoint-50, but the new
+# diversity-collapse early stop can halt SFT before step 50 and the
+# pinned sub-checkpoint would not exist; the rolling dir always has
+# the latest weights, so GRPO + preflight load the same artefact
+# regardless of where SFT stopped.
+SFT_FOR_GRPO="${SFT_FOR_GRPO:-checkpoints/sft_warmup}"
 FORCE_SFT="${FORCE_SFT:-0}"
 # Set to 1 when the caller (e.g. run_lightning_pipeline.sh) has already
 # installed a CUDA-matched torch + unsloth stack and we MUST NOT let
