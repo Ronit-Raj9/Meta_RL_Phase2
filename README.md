@@ -29,7 +29,7 @@ An LLM (Qwen2.5-3B-Instruct) learning to outperform a 50-year-old graph-matching
 
 - **HF Space (live demo + API):** [ronitraj/QuantumScribe](https://huggingface.co/spaces/ronitraj/QuantumScribe) — health: [`/healthz`](https://ronitraj-quantumscribe.hf.space/healthz)
 - **Trained LoRA on the Hub:** [ronitraj/quantumscribe](https://huggingface.co/ronitraj/quantumscribe)
-- **Colab notebook:** [`notebooks/colab_train.ipynb`](notebooks/colab_train.ipynb)
+- **Colab notebook (actual training run):** [`notebooks/meta_final.ipynb`](notebooks/meta_final.ipynb)
 - **2-min video:** <!-- TODO: replace with submission video URL -->TBD-replace
 - **Blog:** <!-- TODO: replace with blog post URL -->TBD-replace
 - **W&B project:** [ronitraj/QuantumScribe-GRPO](https://wandb.ai/ronitraj/QuantumScribe-GRPO) · SFT [`yli513jl`](https://wandb.ai/ronitraj/QuantumScribe-GRPO/runs/yli513jl) · GRPO [`4p7eurnc`](https://wandb.ai/ronitraj/QuantumScribe-GRPO/runs/4p7eurnc)
@@ -286,7 +286,7 @@ python -m scripts.train_grpo \
 python -m scripts.eval --adapter checkpoints/grpo --episodes 1000 --out data/eval_grpo.json
 ```
 
-End-to-end: [notebooks/colab_train.ipynb](notebooks/colab_train.ipynb). Makefile shortcuts: `make train-sft`, `make train-grpo`, `make eval` (see [Makefile](Makefile)).
+End-to-end: [notebooks/meta_final.ipynb](notebooks/meta_final.ipynb). Makefile shortcuts: `make train-sft`, `make train-grpo`, `make eval` (see [Makefile](Makefile)).
 
 #### Local dev: run everything (no Docker)
 
@@ -377,7 +377,7 @@ scripts/
   validate_env.py, generate_sft_data.py, train_sft.py, train_grpo.py, eval.py
   baseline_policies.py, plot_results.py, plot_data_figures.py, animate_grid.py, willow_validation.py
   format_test.py, diversity_preflight.py, deploy_to_space.py, sync_kaggle_bundle.py
-tests/     data/     figures/     checkpoints/     notebooks/colab_train.ipynb
+tests/     data/     figures/     checkpoints/     notebooks/meta_final.ipynb
 app_gradio.py   Dockerfile   openenv.yaml   Makefile
 ```
 

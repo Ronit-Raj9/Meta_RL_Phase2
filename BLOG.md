@@ -17,7 +17,7 @@ We trained Qwen2.5-3B-Instruct with SFT followed by GRPO. Inference happens behi
 
 - 🧪 **Live environment**: <https://huggingface.co/spaces/ronitraj/QuantumScribe>
 - 🏋️ **Trained adapter**: <https://huggingface.co/ronitraj/quantumscribe>
-- 📒 **Colab notebook**: [`notebooks/colab_train.ipynb`](notebooks/colab_train.ipynb)
+- 📒 **Colab notebook (actual training run)**: [`notebooks/meta_final.ipynb`](notebooks/meta_final.ipynb)
 - 📈 **W&B project**: <https://wandb.ai/ronitraj/QuantumScribe-GRPO>
 
 ---
@@ -239,7 +239,7 @@ python -m scripts.eval --adapter ronitraj/quantumscribe --level L2_target --epis
 ```
 
 To re-run training (T4 colab):
-- Open `notebooks/colab_train.ipynb`
+- Open `notebooks/meta_final.ipynb`
 - Runtime → GPU → T4
 - Run all cells
 
@@ -251,7 +251,7 @@ To re-run training (T4 colab):
 |---|---|
 | 🧪 Live HF Space | <https://huggingface.co/spaces/ronitraj/QuantumScribe> |
 | 🏋️ Trained LoRA adapter | <https://huggingface.co/ronitraj/quantumscribe> |
-| 📒 Colab training notebook | [`notebooks/colab_train.ipynb`](notebooks/colab_train.ipynb) |
+| 📒 Colab training notebook (actual run) | [`notebooks/meta_final.ipynb`](notebooks/meta_final.ipynb) |
 | 📈 W&B project | <https://wandb.ai/ronitraj/QuantumScribe-GRPO> |
 | 🛠 OpenEnv manifest | [`openenv.yaml`](openenv.yaml) |
 | 📐 Architecture deep-dive | [`docs/architecture.md`](docs/architecture.md) |
