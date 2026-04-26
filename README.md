@@ -34,6 +34,7 @@ An LLM (Qwen2.5-3B-Instruct) learning to outperform a 50-year-old graph-matching
 - **Blog:** <!-- TODO: replace with blog post URL -->TBD-replace
 - **W&B project:** [ronitraj/QuantumScribe-GRPO](https://wandb.ai/ronitraj/QuantumScribe-GRPO) · SFT [`yli513jl`](https://wandb.ai/ronitraj/QuantumScribe-GRPO/runs/yli513jl) · GRPO [`4p7eurnc`](https://wandb.ai/ronitraj/QuantumScribe-GRPO/runs/4p7eurnc)
 - **OpenEnv manifest:** [`openenv.yaml`](openenv.yaml)
+- **Mini-blog (judges' walkthrough):** [`BLOG.md`](BLOG.md)
 
 ---
 
