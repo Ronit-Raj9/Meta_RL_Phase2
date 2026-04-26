@@ -1,0 +1,18 @@
+{
+  "name": "random",
+  "level": "L1_warmup",
+  "episodes": 100,
+  "logical_correction_rate": 0.59,
+  "pymatching_beat_rate": 0.0,
+  "format_compliance_rate": 1.0,
+  "format_partial_rate": 0.0,
+  "syndrome_consistency_rate": 0.17,
+  "mean_syndrome_consistency": 0.62,
+  "mean_hamming_overlap": 0.1543713924963925,
+  "mean_total_reward": 0.46909284812409807,
+  "exact_match_pymatching": 0.0,
+  "mean_output_length": 0.0,
+  "elapsed_seconds": 59.683,
+  "throughput_ep_per_s": 1.676,
+  "url": "https://ronitraj-quantumscribe.hf.space"
+}

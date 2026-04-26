@@ -1,0 +1,18 @@
+{
+  "name": "zeros",
+  "level": "L2_target",
+  "episodes": 100,
+  "logical_correction_rate": 0.92,
+  "pymatching_beat_rate": 0.0,
+  "format_compliance_rate": 1.0,
+  "format_partial_rate": 0.0,
+  "syndrome_consistency_rate": 0.51,
+  "mean_syndrome_consistency": 0.755,
+  "mean_hamming_overlap": 0.69,
+  "mean_total_reward": 0.7454999999999999,
+  "exact_match_pymatching": 0.0,
+  "mean_output_length": 0.0,
+  "elapsed_seconds": 58.86,
+  "throughput_ep_per_s": 1.699,
+  "url": "https://ronitraj-quantumscribe.hf.space"
+}
