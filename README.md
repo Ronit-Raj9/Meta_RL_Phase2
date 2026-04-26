@@ -29,6 +29,11 @@ short_description: OpenEnv RL env that teaches an LLM to decode quantum errors.
 
 ![Qubit-Medic decoding a syndrome on the rotated surface code](figures/grid_hero.png)
 
+**Hugging Face**
+
+- **Space:** [https://huggingface.co/spaces/ronitraj/QuantumScribe](https://huggingface.co/spaces/ronitraj/QuantumScribe) — live OpenEnv server + API; liveness: [https://ronitraj-quantumscribe.hf.space/healthz](https://ronitraj-quantumscribe.hf.space/healthz)
+- **Model (LoRA):** [https://huggingface.co/ronitraj/quantumscribe](https://huggingface.co/ronitraj/quantumscribe) — PEFT adapter and tokenizer
+
 ---
 
 ## Quick links
