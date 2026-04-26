@@ -47,7 +47,7 @@ We generate synthetic surface-code syndromes using **Stim** ([Gidney 2021](https
 ![Surface-code grid animation](figures/grid_animation.gif)
 
 ## Environment
-
+![alt text](image.png)
 | Field | Value |
 |---|---|
 | Observation | `QubitMedicObservation` — `prompt` (text), `syndrome` bits, `level`, `episode_id`, curriculum metadata (see [`qubit_medic/server/openenv_adapter.py`](qubit_medic/server/openenv_adapter.py)) |
