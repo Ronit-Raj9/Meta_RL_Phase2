@@ -37,10 +37,17 @@ def _summary(name: str, results: list[dict]) -> dict:
     benchmarks against (sections 6 + 7 of the locked spec).
 
     Each entry in ``results`` is the env's per-step ``info["rewards"]``
-    dict, optionally with extra fields the model-eval loop added
-    (``exact_match_pymatching``, ``output_length``).
+    dict, optionally with extra fields the eval loop decorated:
+        * ``exact_match_pymatching`` (model-eval only)
+        * ``output_length`` (model-eval only)
+        * ``n_true_errors`` (any caller; enables hard-syndrome subset)
     """
     n = max(1, len(results))
+    # Hard-syndrome subset = episodes where the simulated truth contains
+    # at least 2 X|Z errors. This is the cohort where MWPM ambiguity
+    # matters and trained-model contributions are most visible.
+    hard = [r for r in results if int(r.get("n_true_errors", 0)) >= 2]
+    n_hard = len(hard)
     out = {
         "name": name,
         "episodes": len(results),
@@ -68,6 +75,16 @@ def _summary(name: str, results: list[dict]) -> dict:
             sum(int(r.get("exact_match_pymatching", 0)) for r in results) / n,
         "mean_output_length":
             sum(int(r.get("output_length", 0)) for r in results) / n,
+        # Hard-syndrome subset (FIX 5, 2026-04 eval spec). Easy syndromes
+        # are where every baseline already hits ~95%+; the hard subset is
+        # where differentiation actually shows up.
+        "hard_syndrome_count": n_hard,
+        "hard_syndrome_lcr":
+            (sum(r["logical_correction"] >= 0.5 for r in hard) / n_hard
+             if n_hard else 0.0),
+        "hard_syndrome_beat_rate":
+            (sum(r["pymatching_beat"] >= 0.5 for r in hard) / n_hard
+             if n_hard else 0.0),
     }
     return out
 
@@ -94,7 +111,12 @@ def _eval_baseline(name: str, episodes: int, level: str,
         obs = client.reset(forced_level=level, seed=10_000 + ep)
         completion = pol(obs)
         result = client.step(raw_response=completion, episode_id=obs.episode_id)
-        rwd = result.info["rewards"]
+        rwd = dict(result.info["rewards"])  # copy so we can decorate
+        # Tag with true-error count so _summary can filter the hard subset.
+        rwd["n_true_errors"] = (
+            len(result.info.get("pymatching_x_errors", []) or [])
+            + len(result.info.get("pymatching_z_errors", []) or [])
+        )
         rewards.append(rwd)
         if collect_rows and ep < 50:  # cap table size
             rows.append({
@@ -162,6 +184,7 @@ def _eval_model(adapter: str, episodes: int, level: str,
             and our_x == pm_x and our_z == pm_z
         )
         rwd["output_length"] = n_tokens
+        rwd["n_true_errors"] = len(pm_x) + len(pm_z)
         rewards.append(rwd)
 
         if collect_rows and ep < 50:
