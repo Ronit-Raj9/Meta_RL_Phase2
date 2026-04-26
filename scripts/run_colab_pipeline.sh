@@ -130,6 +130,53 @@ else
   echo "[colab-pipeline] found ${SFT_FOR_GRPO}; skipping generate_sft_data and train_sft (FORCE_SFT=1 to run SFT anyway)"
 fi
 
+# ------------------------------------------------------------------ #
+# Diversity preflight gate (2026-04 spec, FIX 2)
+# ------------------------------------------------------------------ #
+# Before letting GRPO touch the GPU, verify the SFT model still
+# produces diverse outputs at temperature=1.2. If every checkpoint
+# converged to one canonical completion (output_diversity=1), GRPO
+# cannot compute non-zero within-group reward variance, so the
+# advantage vanishes and the model just sits.
+#
+# On FAIL the pipeline re-runs SFT ONCE with --lora-dropout 0.15
+# (an extra step beyond the new 0.10 default) and re-checks. Two
+# consecutive failures abort the pipeline so we don't burn GPU time
+# on a model that GRPO can't recover.
+# ------------------------------------------------------------------ #
+echo "[colab-pipeline] running diversity preflight against checkpoints/sft_warmup"
+PREFLIGHT_RC=0
+python -m scripts.diversity_preflight \
+  --sft-checkpoint checkpoints/sft_warmup \
+  --val data/sft_validation.jsonl \
+  || PREFLIGHT_RC=$?
+
+if [[ "${PREFLIGHT_RC}" != "0" ]]; then
+  echo "[colab-pipeline] diversity preflight FAILED (rc=${PREFLIGHT_RC}); re-running SFT with --lora-dropout 0.15"
+  python -m scripts.train_sft \
+    --dataset data/sft_dataset.jsonl \
+    --val-dataset data/sft_validation.jsonl \
+    --output checkpoints/sft_warmup \
+    --lora-dropout 0.15 \
+    --report-to "${REPORT_TO}" \
+    --wandb-group "${GROUP}"
+
+  echo "[colab-pipeline] re-running diversity preflight after dropout-0.15 SFT retry"
+  PREFLIGHT_RC=0
+  python -m scripts.diversity_preflight \
+    --sft-checkpoint checkpoints/sft_warmup \
+    --val data/sft_validation.jsonl \
+    || PREFLIGHT_RC=$?
+  if [[ "${PREFLIGHT_RC}" != "0" ]]; then
+    echo "[colab-pipeline] FATAL: diversity preflight FAILED again after retry."
+    echo "[colab-pipeline] Refusing to launch GRPO on a collapsed model."
+    echo "[colab-pipeline] Investigate the SFT data distribution / loss masking"
+    echo "[colab-pipeline] before running this pipeline again."
+    exit 30
+  fi
+fi
+echo "[colab-pipeline] diversity preflight PASSED; launching GRPO"
+
 python -m scripts.train_grpo \
   --sft-checkpoint "${SFT_FOR_GRPO}" \
   --output checkpoints/grpo_final \

@@ -34,10 +34,14 @@ def env_fixture():
 
 
 def test_format_compliance_levels():
+    # 2026-04 spec rewrite (FIX 1): format compliance is now binary
+    # {0.0, 1.0} - partial credit (0.5) was removed because it left the
+    # reward landscape too flat for GRPO to escape the empty-everywhere
+    # mode. Full parse -> 1.0; anything else -> 0.0.
     parsed = ParseResult([1], [], parse_success=True, parse_partial=False, raw_response="")
     assert reward_format_compliance(parsed) == 1.0
     parsed = ParseResult([1], [], parse_success=False, parse_partial=True, raw_response="")
-    assert reward_format_compliance(parsed) == 0.5
+    assert reward_format_compliance(parsed) == 0.0
     parsed = ParseResult([], [], parse_success=False, parse_partial=False, raw_response="")
     assert reward_format_compliance(parsed) == 0.0
 
@@ -92,6 +96,59 @@ def test_compute_all_rewards_in_unit_interval(env_fixture):
     assert 0.0 <= r.total <= 1.0
     for v in r.as_dict().values():
         assert 0.0 <= v <= 1.0
+
+
+def test_empty_prediction_on_nonempty_truth_is_penalised(env_fixture):
+    """Regression guard for FIX 1 (2026-04 RL spec rewrite).
+
+    Pre-fix: predicting empty on a non-empty syndrome could score ~0.85
+    on the weighted total because hamming_overlap returned 1.0 for two
+    empty sets and syndrome_consistency saw plausibly-zero implied bits.
+    Post-fix: hamming_overlap is set-aware (missed-error case scores
+    0.0) and syndrome_consistency caps empty predictions on non-empty
+    syndromes at 0.5. Empty-everywhere should score WELL below 0.85.
+    """
+    from dataclasses import replace
+    from qubit_medic.server.physics import sample_episode
+    circuit, matching, layout, supports = env_fixture
+
+    # Find a syndrome with at least one true X or Z error so the new
+    # set-aware Jaccard rule has something to bite on.
+    sample = None
+    for s in range(200):
+        cand = sample_episode(circuit, matching, layout, seed=s)
+        if cand.true_x_errors or cand.true_z_errors:
+            sample = cand
+            break
+    assert sample is not None, "no non-trivial syndrome in 200 seeds"
+
+    empty_pred = ParseResult([], [], parse_success=True, parse_partial=False,
+                             raw_response="X_ERRORS=[] Z_ERRORS=[]",
+                             strict_format=True)
+    r = compute_all_rewards(empty_pred, sample, layout, supports)
+    # Headline claim from the spec: weighted total should be well below
+    # the pre-fix ~0.85; the spec calls out "~0.5" as the new ceiling.
+    assert r.total <= 0.6, (
+        f"empty prediction on non-empty truth should not score above 0.6; "
+        f"got total={r.total:.3f} breakdown={r.as_dict()}"
+    )
+    # Hamming overlap on missed errors is exactly 0.0 by the new rule.
+    # Whether jx OR jz hit 0.0 depends on which axis carries the truth;
+    # the average is 0.5 only if exactly one axis is non-empty.
+    assert r.hamming_overlap <= 0.5, (
+        f"hamming_overlap on empty/non-empty axis should be <= 0.5; "
+        f"got {r.hamming_overlap:.3f}"
+    )
+
+
+def test_set_aware_jaccard_rule(env_fixture):
+    """Direct unit test of the four-case rule in _set_aware_jaccard."""
+    from qubit_medic.server.rewards import _set_aware_jaccard
+    assert _set_aware_jaccard([], []) == 1.0          # empty / empty
+    assert _set_aware_jaccard([], [1]) == 0.0         # false alarm
+    assert _set_aware_jaccard([1], []) == 0.0         # missed errors
+    assert _set_aware_jaccard([1], [1]) == 1.0        # exact agreement
+    assert _set_aware_jaccard([1, 2], [2, 3]) == 1/3  # standard Jaccard
 
 
 def test_pymatching_imitator_logical_correction_high(env_fixture):

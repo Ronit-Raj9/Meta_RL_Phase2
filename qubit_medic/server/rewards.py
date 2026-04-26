@@ -84,13 +84,21 @@ def reward_syndrome_consistency(
 ) -> float:
     """How well does the predicted Pauli frame reproduce the FINAL detectors?
 
-    Computes Hamming similarity between ``predicted_final_bits`` (induced by
-    the predicted X errors) and ``observed_final_bits``. Returns
+    Computes Hamming similarity between ``predicted_final_bits`` (induced
+    by the predicted X errors) and ``observed_final_bits``. Returns
     ``1 - hamming_distance / num_final_detectors``.
 
     Rationale (Section 3.2): without this term, an LLM that lucky-guesses
-    the right qubits could get Reward 1 occasionally; this signal forces it
-    to also explain the data the syndrome carries.
+    the right qubits could get Reward 1 occasionally; this signal forces
+    it to also explain the data the syndrome carries.
+
+    2026-04 anti-collapse cap (FIX 1, RL spec rewrite): if the prediction
+    is empty AND the observed syndrome is non-empty (at least one
+    detector fired), cap the score at 0.5. Without this cap, the
+    "always predict empty" policy can still pull a high syndrome-
+    consistency score on the prompts where the implied final-round bits
+    happen to coincide with zeros, which kept GRPO trapped in the
+    constant-empty mode.
     """
     final_dets = layout.final_detectors
     if not final_dets:
@@ -104,7 +112,17 @@ def reward_syndrome_consistency(
         predicted = implied.get(det_idx, 0)
         if observed != predicted:
             distance += 1
-    return 1.0 - distance / len(final_dets)
+    base = 1.0 - distance / len(final_dets)
+
+    # Anti-collapse cap: empty prediction + non-empty observed syndrome
+    # is a "did nothing while alarms were firing" failure mode. Cap at
+    # 0.5 so the empty policy can never approach the full 1.0 even when
+    # the implied final-round bits happen to coincide.
+    pred_is_empty = (not parsed.x_errors) and (not parsed.z_errors)
+    has_active_syndrome = any(int(b) != 0 for b in sample.syndrome_bits)
+    if pred_is_empty and has_active_syndrome:
+        return min(base, 0.5)
+    return base
 
 
 def compute_final_detector_supports(
@@ -141,13 +159,37 @@ def compute_final_detector_supports(
 # --------------------------------------------------------------------------- #
 
 
-def _jaccard(a: list[int], b: list[int]) -> float:
-    """Jaccard index. Returns 1.0 when both sets are empty (perfect agreement)."""
-    sa, sb = set(a), set(b)
-    if not sa and not sb:
-        return 1.0
-    inter = len(sa & sb)
-    union = len(sa | sb)
+def _set_aware_jaccard(true_set: list[int], pred_set: list[int]) -> float:
+    """Set-aware Jaccard: penalises BOTH false alarms and missed errors.
+
+    2026-04 spec rewrite (FIX 1). The four-case rule is what makes
+    "predict empty everywhere" stop being a near-optimal strategy:
+
+    +-------------+-----------+-----------------------------------------+
+    | true_set    | pred_set  | score                                   |
+    +-------------+-----------+-----------------------------------------+
+    | empty       | empty     | 1.0   (perfect, "no errors -> no edit") |
+    | empty       | non-empty | 0.0   false alarm                       |
+    | non-empty   | empty     | 0.0   missed errors  <-- the key change |
+    | non-empty   | non-empty | |inter| / |union|  (standard Jaccard)   |
+    +-------------+-----------+-----------------------------------------+
+
+    Critically the third case used to score 1.0 under the prior plain
+    Jaccard (because both sets were treated symmetrically; "everything
+    correct, just nothing predicted" was indistinguishable from "perfect
+    agreement"). Under this rule a missed-error answer scores 0.0,
+    which moves the GRPO reward landscape so a non-trivial prediction
+    can climb out of the empty-everywhere local optimum.
+    """
+    sa, sp = set(true_set), set(pred_set)
+    if not sa and not sp:
+        return 1.0  # perfect agreement: no true errors AND no claimed errors
+    if not sa and sp:
+        return 0.0  # false alarm: claimed errors that were not there
+    if sa and not sp:
+        return 0.0  # missed errors: alarms fired but model said nothing
+    inter = len(sa & sp)
+    union = len(sa | sp)
     return inter / union if union else 1.0
 
 
@@ -156,16 +198,22 @@ def reward_hamming_overlap(
     sample: SyndromeSample,
     layout: CircuitLayout,
 ) -> float:
-    """Average of Jaccard(X) and Jaccard(Z) against the reference frame.
+    """Average of set-aware Jaccard(X) and set-aware Jaccard(Z) against
+    the GROUND-TRUTH error sets recorded by Stim.
 
-    Reference is PyMatching's per-edge predicted Pauli frame
-    (``sample.pymatching_x_errors`` / ``..._z_errors``). This is the dense
-    partial-credit signal of Section 3.3 - even if Reward 1 fires zero,
-    being *close* to the canonical solution still gets credit, smoothing
-    the reward landscape during early training.
+    2026-04 spec rewrite (FIX 1):
+      * Reference changed from PyMatching's predicted Pauli frame to
+        the actual ``sample.true_x_errors`` / ``sample.true_z_errors``.
+        PyMatching's prediction is itself a noisy estimate; comparing
+        against it rewarded "imitate PyMatching" rather than "decode
+        correctly", which masked the policy when both we AND PyMatching
+        were wrong on the same syndrome.
+      * Per-axis score uses the set-aware rule (see
+        :func:`_set_aware_jaccard`), so missed errors no longer score
+        1.0 just because the prediction set is empty.
     """
-    jx = _jaccard(parsed.x_errors, sample.pymatching_x_errors)
-    jz = _jaccard(parsed.z_errors, sample.pymatching_z_errors)
+    jx = _set_aware_jaccard(sample.true_x_errors, parsed.x_errors)
+    jz = _set_aware_jaccard(sample.true_z_errors, parsed.z_errors)
     return 0.5 * (jx + jz)
 
 
@@ -175,8 +223,16 @@ def reward_hamming_overlap(
 
 
 def reward_format_compliance(parsed: ParseResult) -> float:
-    """1.0 if both keys parsed, 0.5 if exactly one, 0.0 if neither."""
-    return parsed.format_score
+    """Binary {0.0, 1.0}: 1.0 iff the parser fully extracted both lists.
+
+    2026-04 spec rewrite (FIX 1): partial credit (0.5) is removed. With
+    partial credit on, the model could still earn ~half the format
+    weight on garbage outputs that resembled the canonical form, which
+    is part of what kept the reward landscape too flat for GRPO to
+    escape the empty-everywhere mode. The new rule rewards only a
+    cleanly-parsed answer.
+    """
+    return 1.0 if parsed.parse_success else 0.0
 
 
 # --------------------------------------------------------------------------- #

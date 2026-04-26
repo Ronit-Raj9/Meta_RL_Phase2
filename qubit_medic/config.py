@@ -144,9 +144,9 @@ CURRICULUM: tuple[CurriculumLevel, ...] = (
 # --------------------------------------------------------------------------- #
 
 REWARD_WEIGHTS: dict[str, float] = {
-    "logical_correction": 0.40,    # Reward 1 - the unfakeable ground truth
+    "logical_correction": 0.35,    # Reward 1 - the unfakeable ground truth
+    "hamming_overlap": 0.25,       # Reward 3 - dense partial credit
     "syndrome_consistency": 0.20,  # Reward 2 - prevents lucky-guess attacks
-    "hamming_overlap": 0.20,       # Reward 3 - dense partial credit
     "format_compliance": 0.10,     # Reward 4 - parser must succeed
     "pymatching_beat": 0.10,       # Reward 5 - the headline metric
 }
@@ -177,25 +177,49 @@ MODEL_BACKUP_ID: str = "Qwen/Qwen2.5-7B-Instruct"
 # ---- LoRA (shared SFT + GRPO) -------------------------------------------- #
 LORA_R: int = 16
 LORA_ALPHA: int = 32  # 2x rank, standard ratio
-LORA_DROPOUT: float = 0.05
+LORA_DROPOUT: float = 0.10
+"""Bumped 0.05 -> 0.10 (2026-04 SFT regularisation) because the prior
+SFT runs converged to a single-output mode (every checkpoint reported
+output_diversity=1) which left GRPO unable to compute non-zero
+within-group reward variance. 0.10 is the spec's first-pass dropout;
+the post-SFT diversity preflight will bump to 0.15 if needed."""
 LORA_TARGET_MODULES: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
 
-# ---- SFT warmup phase (master spec, section 1) --------------------------- #
+# ---- SFT warmup phase (master spec, section 1; 2026-04 regularisation) -- #
+# 2026-04 changes (diversity-preserving regularisation): SFT collapsed to
+# a constant-output model under the prior settings (LR=2e-4 + dropout=0.05
+# + max_steps=200 left every checkpoint at output_diversity=1). New
+# defaults trade some ceiling LCR for diversity headroom so GRPO has a
+# reward signal to climb.
 SFT_EPOCHS: int = 1
 SFT_BATCH_SIZE: int = 4
 SFT_GRAD_ACCUM: int = 4              # effective batch = 16
-SFT_LR: float = 2e-4
+SFT_LR: float = 1e-4
+"""Halved 2e-4 -> 1e-4 to slow the slide into mode collapse."""
 SFT_LR_SCHEDULER: str = "constant_with_warmup"  # 20-step warmup then constant
 SFT_WARMUP_STEPS: int = 20
 SFT_WEIGHT_DECAY: float = 0.01
+SFT_LABEL_SMOOTHING: float = 0.05
+"""TrainingArguments.label_smoothing_factor; spreads the loss across
+non-target tokens so the model is less rewarded for memorising the
+single highest-likelihood completion."""
 SFT_OPTIMIZER: str = "adamw_8bit"
 SFT_DATASET_SIZE: int = 3_000        # 3,000 train + 100 held-out validation
 SFT_VAL_HOLDOUT: int = 100
 SFT_MAX_SEQ_LEN: int = 1024          # ~300 prompt + ~80 completion + headroom
-SFT_MAX_STEPS: int = 200             # hard cap; 3000/16=187.5 expected
-SFT_EVAL_EVERY: int = 50             # legacy fallback if no schedule given
-SFT_SAVE_EVERY: int = 50
+SFT_MAX_STEPS: int = 50
+"""Cut 200 -> 50 so SFT stops well before the model can grind itself
+into a single-output mode. The format-only knowledge fits in <50
+steps and post-SFT diversity preflight is the gate to GRPO."""
+SFT_EVAL_EVERY: int = 25             # legacy fallback if no schedule given
+SFT_SAVE_EVERY: int = 25
 SFT_LOG_EVERY: int = 10
+SFT_PREFLIGHT_DIVERSITY_FLOOR: int = 2
+"""eval/output_diversity threshold. If two consecutive evals both report
+output_diversity below this floor, the diversity-collapse early stop
+fires and SFT exits with reason=diversity_collapse."""
+SFT_DIVERSITY_COLLAPSE_RUN_LEN: int = 2
+"""Number of consecutive sub-floor evals required before stopping."""
 SFT_MAX_NEW_TOKENS: int = 200        # generation cap during eval
 # Was 128; bumped to 200 because Qwen2.5-Instruct's cold-start reasoning
 # (### Analysis: 1. ... 2. ... 3. ...) regularly runs to 100+ tokens
@@ -217,13 +241,15 @@ SFT_MAX_NEW_TOKENS: int = 200        # generation cap during eval
 # logical_correction / hamming / syndrome metrics, so the eval costs
 # ~30 seconds instead of ~2 minutes.
 SFT_EVAL_SCHEDULE: tuple[tuple[int, int, str], ...] = (
+    # 2026-04: schedule rebuilt to fit the SFT_MAX_STEPS=50 budget. Two
+    # full evals plus a fast format probe gives the diversity-collapse
+    # early-stop two consecutive data points before the run ends, which
+    # is the minimum to fire the new run-length-2 stop rule.
     (5,   30,  "format_only"),
-    (15,  30,  "format_only"),
-    (30,  50,  "full"),
+    (15,  50,  "full"),
+    (25,  100, "full"),
+    (40,  100, "full"),
     (50,  100, "full"),
-    (100, 100, "full"),
-    (150, 100, "full"),
-    (190, 200, "full"),
 )
 SFT_PRINT_SAMPLE_OUTPUTS: int = 5    # raw outputs printed at each eval
 
@@ -238,23 +264,86 @@ SFT_MAX_WALL_SECONDS: float = 30 * 60.0  # 30-minute hard ceiling
 # also pass it explicitly.
 SFT_CHECKPOINT_PATH_FOR_GRPO: str = "checkpoints/sft_warmup/checkpoint-50"
 
-# ---- GRPO RL phase (master spec, section 5) ------------------------------ #
-GRPO_STEPS: int = 2_000
+# ---- GRPO RL phase (master spec, section 5; 2026-04 spec rewrite) -------- #
+# All numbers below were re-pinned by the 2026-04 GRPO spec. The previous
+# defaults (GRPO_STEPS=2000, LR=1e-5, KL=0.04, max_prompt=512,
+# max_completion=256, temperature=0.7) produced a degenerate "always say
+# []" policy in <100 steps because reward variance collapsed and KL
+# saturated the loss. The new defaults emphasise diversity:
+#
+#   - higher temperature (1.2) + top_k + repetition_penalty -> non-collapsed rollouts
+#   - shorter max_completion_length (50) -> the answer is one short line anyway
+#   - longer max_prompt_length (1500) -> distance-3 syndromes already use
+#     ~280 tokens; distance-5 / curriculum L3 needs the headroom
+#   - lower KL coefficient (0.02) -> reward signal not dominated by KL drift
+#   - 1500 steps -> wall-clock fits the 13h cap with margin
+GRPO_STEPS: int = 1_500
 GRPO_GEN_PER_PROMPT: int = 4         # GRPO needs >=2 for advantage
 GRPO_BATCH_SIZE: int = 1             # per-device prompts per step
 GRPO_GRAD_ACCUM: int = 8             # effective batch = 8 prompts
-GRPO_LR: float = 1e-5                # one order lower than SFT
+GRPO_LR: float = 2e-5                # bumped from 1e-5; reward signal is sparse
 GRPO_LR_SCHEDULER: str = "constant"  # no warmup, no decay
-GRPO_KL_COEF: float = 0.04           # TRL default; alarm if KL > 0.3
-GRPO_MAX_PROMPT_LEN: int = 512       # prompts ~280 tokens
-GRPO_MAX_COMPLETION_LEN: int = 256   # reasoning + answer fits in ~80-150
-GRPO_TEMPERATURE: float = 0.7        # exploration without nonsense
-GRPO_TOP_P: float = 0.95             # nucleus sampling
-GRPO_CHECKPOINT_EVERY: int = 250
-GRPO_LOG_EVERY: int = 10             # real-time visibility
+GRPO_KL_COEF: float = 0.02           # half the TRL default; alarm if KL > 0.3
+GRPO_MAX_PROMPT_LEN: int = 1_500     # surface-code prompts can run long
+GRPO_MAX_COMPLETION_LEN: int = 50    # answer is one line: X_ERRORS=[..] Z_ERRORS=[..]
+
+# ---- Diversity-focused rollout sampling (critical) ----------------------- #
+# These apply to GRPO ROLLOUT generation only. Eval uses temperature=0
+# (greedy) regardless of these. The combination temperature=1.2 + top_p=0.95
+# + top_k=50 + repetition_penalty=1.1 was selected because:
+#   * temperature=1.2 broadens the per-token distribution past the SFT
+#     mode-collapsed favourite ("X_ERRORS=[] Z_ERRORS=[]").
+#   * top_p=0.95 keeps tail tokens in but truncates the long tail.
+#   * top_k=50 caps the candidate set so we don't sample garbage.
+#   * repetition_penalty=1.1 discourages the model from repeating the
+#     exact same byte sequence within a 4-completion group (reduces
+#     "all 4 generations identical" rate, which kills GRPO's gradient).
+GRPO_TEMPERATURE: float = 1.2
+GRPO_TOP_P: float = 0.95
+GRPO_TOP_K: int = 50
+GRPO_REPETITION_PENALTY: float = 1.1
+GRPO_DO_SAMPLE: bool = True
+
+# ---- Checkpoint cadence + retention -------------------------------------- #
+GRPO_CHECKPOINT_EVERY: int = 100
+GRPO_SAVE_TOTAL_LIMIT: int = 3       # keep 3 most recent rolling checkpoints
+GRPO_LOG_EVERY: int = 5              # real-time visibility (every 5 steps)
 GRPO_OPTIMIZER: str = "adamw_8bit"
 GRPO_KL_ALARM: float = 0.3           # >this triggers manual triage
 GRPO_KL_HARD_CEIL: float = 0.5       # >this -> kill the run
+
+# ---- Wall-clock safety --------------------------------------------------- #
+GRPO_WALL_SECONDS: float = 46_800.0   # 13 hours. Save+exit if exceeded.
+
+# ---- Frozen eval set ----------------------------------------------------- #
+# The 200-syndrome eval set is regenerated from the env at GRPO start with
+# this seed. Same seed as SFT validation (sft_validation.jsonl) so eval
+# distributions are comparable across SFT and GRPO. The set is cached on
+# disk under data/grpo_validation.jsonl so reruns hit identical syndromes.
+GRPO_VAL_SEED: int = 4_284
+GRPO_VAL_EPISODES: int = 200
+GRPO_VAL_PATH: str = "data/grpo_validation.jsonl"
+
+# ---- Sample-table logging ------------------------------------------------ #
+GRPO_SAMPLE_LOG_EVERY: int = 50
+GRPO_SAMPLE_LOG_N: int = 5
+
+# ---- Anti-hacking: mode-collapse inspection hook ------------------------- #
+# Every N steps, we sample the most-recent N rollouts and check what
+# fraction of prompts had ALL 4 generations identical. If too many
+# prompts collapsed, raise the rollout temperature by a fixed step.
+GRPO_INSPECTION_HOOK_EVERY: int = 100
+GRPO_INSPECTION_SAMPLE_N: int = 10
+GRPO_INSPECTION_COLLAPSE_THRESHOLD: int = 7  # "> 7 of 10"
+GRPO_TEMP_BUMP_ON_COLLAPSE: float = 0.2
+
+# ---- Decision-rule thresholds (warnings only; no auto-action) ----------- #
+GRPO_DECISION_REWARD_STD_FLOOR: float = 0.03
+GRPO_DECISION_REWARD_STD_CHECK_STEP: int = 50
+GRPO_DECISION_BEAT_RATE_CHECK_STEP: int = 500
+GRPO_DECISION_FORMAT_FLOOR: float = 0.95
+GRPO_DECISION_GRAD_NORM_CEIL: float = 50.0
+GRPO_DECISION_GRAD_NORM_RUN_LEN: int = 3       # consecutive logs
 
 # Decoding sampler defaults at evaluation/format-test time.
 # (Used by greedy eval paths: temp/top_p only matter when do_sample=True.)
@@ -280,8 +369,12 @@ DEFAULT_PORT: int = 7860  # Hugging Face Spaces' default exposed port
 # all log to the same project / dashboard. Override per-run on the CLI.
 import os as _os  # noqa: E402  (local import to keep top of module clean)
 
-WANDB_PROJECT: str = _os.environ.get("WANDB_PROJECT", "QuantumScribe")
-"""Default W&B project name. Override with ``WANDB_PROJECT=...``."""
+WANDB_PROJECT: str = _os.environ.get("WANDB_PROJECT", "QuantumScribe-GRPO")
+"""Default W&B project name. Override with ``WANDB_PROJECT=...``.
+
+Changed 2026-04 from ``"QuantumScribe"`` to ``"QuantumScribe-GRPO"`` per
+the GRPO spec rewrite. SFT runs that should land in the original project
+should set ``WANDB_PROJECT=QuantumScribe`` at the shell."""
 
 WANDB_ENTITY: str | None = _os.environ.get("WANDB_ENTITY", "ronitraj") or None
 """W&B team or username. ``None`` -> wandb's default entity for the user."""
@@ -302,12 +395,16 @@ WANDB_SAMPLE_GENERATIONS: int = 5
 """Number of generations included in each sample-completion table.
 Master spec, section 7: 'Save 5 randomly sampled rollouts ... and their rewards.'"""
 
-WANDB_INLOOP_EVAL_EVERY: int = 250
+WANDB_INLOOP_EVAL_EVERY: int = 100
 """Run an in-loop evaluation pass (deterministic, ``WANDB_INLOOP_EVAL_EPISODES``
-syndromes) every N GRPO steps. Master spec sec. 7: 'every 250 steps'."""
+syndromes) every N GRPO steps. Tightened from 250 -> 100 by the 2026-04 GRPO
+spec rewrite so collapse / drift gets caught within a 5-minute window
+instead of a 15-minute window."""
 
-WANDB_INLOOP_EVAL_EPISODES: int = 100
-"""Held-out syndromes per in-loop eval pass (master spec: 100)."""
+WANDB_INLOOP_EVAL_EPISODES: int = 200
+"""Held-out syndromes per in-loop eval pass. Bumped from 100 -> 200 by the
+2026-04 spec rewrite so eval-stat error bars are tight enough to read
+pymatching_beat_rate movement (which is sub-5% in early training)."""
 
 WANDB_COMPARE_EVERY: int = 500
 """Run the PyMatching head-to-head comparison every N steps (master spec sec. 7)."""

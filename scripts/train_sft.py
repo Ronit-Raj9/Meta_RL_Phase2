@@ -457,6 +457,8 @@ def _build_validation_callback(
     early_stop_diversity: int,
     max_wall_seconds: float,
     started_wall: float,
+    diversity_floor: int = 2,
+    diversity_run_len: int = 2,
 ):
     """Returns a ``TrainerCallback`` that:
        * fires at every step in ``eval_schedule`` (or every ``eval_every``
@@ -511,6 +513,12 @@ def _build_validation_callback(
 
     sample_dir = Path(output_dir)
     sample_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2026-04 (FIX 2) diversity-collapse rolling buffer. We track the
+    # last ``diversity_run_len`` full-eval ``output_diversity`` values
+    # and stop training when every entry is below ``diversity_floor``.
+    from collections import deque as _deque
+    recent_diversity = _deque(maxlen=diversity_run_len)
 
     class _ValidationCallback(TrainerCallback):
         # Stamp the most recent eval here so the on_train_end hook can avoid
@@ -779,6 +787,33 @@ def _build_validation_callback(
                     control.should_training_stop = True
                     wandb_utils.update_summary({"sft/early_stop_reason": "success_criterion"})
 
+                # 2026-04 (FIX 2) diversity-collapse early stop. Pushed
+                # AFTER the success check so a model that satisfies both
+                # criteria still wins; only sustained low diversity
+                # without convergence triggers the regression stop.
+                recent_diversity.append(int(metrics["eval/output_diversity"]))
+                if (
+                    not final
+                    and not control.should_training_stop
+                    and len(recent_diversity) >= diversity_run_len
+                    and all(d < diversity_floor for d in recent_diversity)
+                ):
+                    history = list(recent_diversity)
+                    print(
+                        f"[sft] diversity collapse early stop at step "
+                        f"{state.global_step}: eval/output_diversity has "
+                        f"been < {diversity_floor} for {diversity_run_len} "
+                        f"consecutive full evals (history={history}). "
+                        f"Stopping. Bump --lora-dropout (e.g. 0.15) or "
+                        f"increase label smoothing and rerun."
+                    )
+                    control.should_training_stop = True
+                    wandb_utils.update_summary({
+                        "sft/early_stop_reason": "diversity_collapse",
+                        "sft/diversity_collapse_step": state.global_step,
+                        "sft/diversity_collapse_history": history,
+                    })
+
             try:
                 from unsloth import FastLanguageModel
                 FastLanguageModel.for_training(model)
@@ -885,11 +920,12 @@ def main(argv: Iterable[str] = ()) -> int:
     from qubit_medic import wandb_utils
     from qubit_medic.config import (
         LORA_ALPHA, LORA_DROPOUT, LORA_R, LORA_TARGET_MODULES, MODEL_ID,
-        PRIMARY_SEED, SFT_BATCH_SIZE, SFT_EARLY_STOP_CORRECTION,
-        SFT_EARLY_STOP_DIVERSITY, SFT_EARLY_STOP_FORMAT, SFT_EPOCHS,
-        SFT_EVAL_EVERY, SFT_EVAL_SCHEDULE, SFT_GRAD_ACCUM, SFT_LOG_EVERY,
-        SFT_LR, SFT_LR_SCHEDULER, SFT_MAX_NEW_TOKENS, SFT_MAX_SEQ_LEN,
-        SFT_MAX_STEPS, SFT_MAX_WALL_SECONDS, SFT_OPTIMIZER,
+        PRIMARY_SEED, SFT_BATCH_SIZE, SFT_DIVERSITY_COLLAPSE_RUN_LEN,
+        SFT_EARLY_STOP_CORRECTION, SFT_EARLY_STOP_DIVERSITY,
+        SFT_EARLY_STOP_FORMAT, SFT_EPOCHS, SFT_EVAL_EVERY, SFT_EVAL_SCHEDULE,
+        SFT_GRAD_ACCUM, SFT_LABEL_SMOOTHING, SFT_LOG_EVERY, SFT_LR,
+        SFT_LR_SCHEDULER, SFT_MAX_NEW_TOKENS, SFT_MAX_SEQ_LEN, SFT_MAX_STEPS,
+        SFT_MAX_WALL_SECONDS, SFT_OPTIMIZER, SFT_PREFLIGHT_DIVERSITY_FLOOR,
         SFT_PRINT_SAMPLE_OUTPUTS, SFT_SAVE_EVERY, SFT_WARMUP_STEPS,
         SFT_WEIGHT_DECAY,
     )
@@ -1071,6 +1107,12 @@ def main(argv: Iterable[str] = ()) -> int:
         gradient_accumulation_steps=grad_accum,
         learning_rate=lr,
         weight_decay=SFT_WEIGHT_DECAY,
+        # Label smoothing was added in the 2026-04 SFT regularisation
+        # rewrite (FIX 2) to combat mode collapse: spreading the loss
+        # across non-target tokens makes the model less sharply rewarded
+        # for memorising one canonical completion, which is what kept
+        # output_diversity at 1 across every prior checkpoint.
+        label_smoothing_factor=SFT_LABEL_SMOOTHING,
         warmup_steps=SFT_WARMUP_STEPS,
         lr_scheduler_type=SFT_LR_SCHEDULER,
         optim=SFT_OPTIMIZER,
@@ -1104,6 +1146,9 @@ def main(argv: Iterable[str] = ()) -> int:
         early_stop_diversity=SFT_EARLY_STOP_DIVERSITY,
         max_wall_seconds=SFT_MAX_WALL_SECONDS,
         started_wall=started_wall,
+        # 2026-04 (FIX 2) diversity-collapse regression early stop.
+        diversity_floor=SFT_PREFLIGHT_DIVERSITY_FLOOR,
+        diversity_run_len=SFT_DIVERSITY_COLLAPSE_RUN_LEN,
     )
     if val_cb is not None:
         callbacks.append(val_cb)
