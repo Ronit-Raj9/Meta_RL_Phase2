@@ -1,0 +1,15 @@
+{
+  "name": "model[checkpoints/grpo_final]",
+  "episodes": 1000,
+  "logical_correction_rate": 0.964,
+  "pymatching_beat_rate": 0.0,
+  "format_compliance_rate": 1.0,
+  "format_partial_rate": 0.0,
+  "syndrome_consistency_rate": 0.734,
+  "mean_syndrome_consistency": 0.867,
+  "mean_hamming_overlap": 0.8405,
+  "mean_total_reward": 0.8209249999999999,
+  "exact_match_pymatching": 0.734,
+  "mean_output_length": 7.0,
+  "level": "L2_target"
+}
