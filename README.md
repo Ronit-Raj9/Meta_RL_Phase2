@@ -255,6 +255,58 @@ python -m scripts.eval --adapter checkpoints/grpo --episodes 1000 --out data/eva
 
 End-to-end: [notebooks/colab_train.ipynb](notebooks/colab_train.ipynb). Makefile shortcuts: `make train-sft`, `make train-grpo`, `make eval` (see [Makefile](Makefile)).
 
+### Local dev: run everything (no Docker)
+
+**1. Base environment (CPU OK)** — OpenEnv / Stim / tests:
+
+```bash
+cd /path/to/errorCorrection
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -U pip
+pip install -r requirements.txt
+make validate
+make tests
+```
+
+**2. OpenEnv HTTP server (no LLM — physics + reward only)** — good for API checks and `curl` / a browser:
+
+```bash
+# default: 0.0.0.0:7860 (or set QUBIT_MEDIC_PORT)
+python -m qubit_medic.server.app
+# dev reload:
+uvicorn qubit_medic.server.app:app --reload --host 0.0.0.0 --port 7860
+```
+
+- Docs: [http://127.0.0.1:7860/docs](http://127.0.0.1:7860/docs)  
+- Health: [http://127.0.0.1:7860/healthz](http://127.0.0.1:7860/healthz)
+
+**3. Gradio grid demo (Stim + PyMatching only)** — *does not* load the trained LLM in code today; it visualises the classical decoder.
+
+```bash
+pip install "gradio>=4"
+PORT=7860 python app_gradio.py
+# open http://127.0.0.1:7860 — if the OpenEnv server is already on 7860, use e.g. PORT=7861
+```
+
+**4. Run with the real model (Unsloth + LoRA) — this is the supported path** — needs a **GPU** and training deps. The eval harness loads the adapter and uses [`LocalDecoderClient`](qubit_medic/client/client.py) (in-process env, no separate server).
+
+```bash
+pip install -r requirements-train.txt
+# optional: export HF_TOKEN=...  for gated/private Hub repos
+python -m scripts.eval \
+  --adapter ronitraj/quantumscribe \
+  --episodes 50 \
+  --level L2_target \
+  --max-new-tokens 160
+```
+
+- Use a **local LoRA folder** the same way: `--adapter /path/to/checkpoints/grpo/final` (the directory that contains `adapter_model.safetensors`).  
+- The script calls `FastLanguageModel.from_pretrained(model_name=adapter, …)`; for Hub PEFT repos, Unsloth/transformers should resolve the base from `adapter_config.json`. If loading fails, run `hf download ronitraj/quantumscribe` and point `--adapter` at the local folder.  
+- Shorter run first (e.g. `--episodes 5`) to confirm VRAM, then increase.
+
+**5. What is *not* wired** — the **Docker** Space image does not install `torch`/Unsloth; the **Gradio** app’s markdown mentions `QUBIT_MEDIC_ADAPTER` but **there is no LLM inference in `app_gradio.py` yet**—use `scripts.eval` for the trained policy.
+
 ---
 
 ## Publish the adapter to the Hub
