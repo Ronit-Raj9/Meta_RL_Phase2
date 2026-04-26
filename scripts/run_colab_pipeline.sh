@@ -89,15 +89,28 @@ if [[ "${SKIP_PIP_INSTALL}" != "1" ]]; then
   # cannot re-resolve it upward, and force-reinstall so an existing
   # 2026.x install on the Colab box is actually replaced.
   # ------------------------------------------------------------------ #
-  echo "[colab-pipeline] pinning unsloth==2025.11.1 + unsloth_zoo==2025.11.1 for GRPO compatibility"
+  # 2026-04-25: switching pin to unsloth==2025.11.1 + unsloth_zoo==2026.4.9
+  # (the same matched pair the Lightning pipeline uses). The user's run
+  # crashed at GRPO step 0 with:
+  #
+  #   TypeError: grpo_accumulated_loss() missing 2 required positional
+  #   arguments: 'old_logps' and 'ref_logps'
+  #
+  # That happens when unsloth's GRPO call site uses the NEW kwargs
+  # (old_logps / ref_logps) but the installed unsloth_zoo's
+  # grpo_accumulated_loss is the OLD signature (old_hidden_states /
+  # ref_hidden_states). 2025.11.1's source has been updated to call with
+  # the NEW names, so we need the matching NEW-signature unsloth_zoo
+  # release (2026.4.9) instead of the old 2025.11.1 to match.
+  echo "[colab-pipeline] pinning unsloth==2025.11.1 + unsloth_zoo==2026.4.9 for GRPO compatibility"
   python -m pip install --no-deps --force-reinstall \
     "unsloth==2025.11.1" \
-    "unsloth_zoo==2025.11.1"
+    "unsloth_zoo==2026.4.9"
 
   # Verify the pin actually stuck and the function signature is the
-  # OLD one (old_hidden_states / ref_hidden_states). Refusing to
-  # continue here costs a few seconds; missing the bug here costs
-  # the full SFT runtime + a confusing TypeError at GRPO step 0.
+  # NEW one (old_logps / ref_logps). Refusing to continue here costs a
+  # few seconds; missing the bug here costs the full SFT runtime + a
+  # confusing TypeError at GRPO step 0.
   python - <<'PY'
 import inspect, sys
 import unsloth, unsloth_zoo
@@ -106,13 +119,13 @@ params = list(inspect.signature(grpo_accumulated_loss).parameters.keys())
 print(f"[colab-pipeline]   unsloth     = {unsloth.__version__}")
 print(f"[colab-pipeline]   unsloth_zoo = {unsloth_zoo.__version__}")
 print(f"[colab-pipeline]   grpo_accumulated_loss params = {params}")
-if "old_hidden_states" not in params or "ref_hidden_states" not in params:
+if "old_logps" not in params or "ref_logps" not in params:
     sys.stderr.write(
         "[colab-pipeline] FATAL: unsloth_zoo pin did not stick.\n"
-        "[colab-pipeline] grpo_accumulated_loss is missing old_hidden_states/\n"
-        "[colab-pipeline] ref_hidden_states -- this is the signature that\n"
-        "[colab-pipeline] crashes at GRPO step 0. Aborting BEFORE wasting GPU\n"
-        "[colab-pipeline] minutes on SFT.\n"
+        "[colab-pipeline] grpo_accumulated_loss is missing old_logps/ref_logps\n"
+        "[colab-pipeline] -- this is the signature that crashes at GRPO step 0\n"
+        "[colab-pipeline] when unsloth==2025.11.1 calls with the NEW kwargs.\n"
+        "[colab-pipeline] Aborting BEFORE wasting GPU minutes on SFT.\n"
     )
     sys.exit(20)
 print("[colab-pipeline] unsloth/unsloth_zoo signatures match -- safe to train.")
