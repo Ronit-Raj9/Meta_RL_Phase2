@@ -24,6 +24,7 @@ import sys
 from typing import Optional
 
 from fastapi import Body, HTTPException
+from fastapi.responses import HTMLResponse
 from openenv.core import create_fastapi_app
 
 from qubit_medic.config import DEFAULT_HOST, DEFAULT_PORT
@@ -183,6 +184,48 @@ def decode(
             px, cache.layout
         ),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Root landing page                                                            #
+# --------------------------------------------------------------------------- #
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def root() -> HTMLResponse:
+    """HTML landing page shown in the HF Spaces App tab."""
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Qubit-Medic — OpenEnv server</title>
+  <style>
+    body { font-family: sans-serif; max-width: 680px; margin: 60px auto; color: #e0e0e0; background: #0d1117; }
+    h1   { font-size: 1.5rem; }
+    a    { color: #58a6ff; }
+    code { background: #161b22; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+    ul   { line-height: 2; }
+  </style>
+</head>
+<body>
+  <h1>Qubit-Medic &mdash; OpenEnv server</h1>
+  <p>
+    This Space exposes a <strong>JSON API</strong> for the quantum
+    error-decoding environment (Stim + PyMatching, OpenEnv contract).
+    Use the links below to interact with it.
+  </p>
+  <ul>
+    <li><a href="/docs">Interactive API docs (Swagger)</a></li>
+    <li><a href="/redoc">ReDoc</a></li>
+    <li><a href="/healthz">Liveness <code>GET /healthz</code></a> &mdash; versions probe</li>
+    <li><a href="/metadata">OpenEnv <code>GET /metadata</code></a></li>
+  </ul>
+  <p>
+    Typical flow: <code>POST /reset</code> then <code>POST /step</code>
+    with the model&rsquo;s text action &mdash; see the schema in <a href="/docs">/docs</a>.
+  </p>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 # --------------------------------------------------------------------------- #

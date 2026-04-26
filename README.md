@@ -1,5 +1,5 @@
 ---
-title: Qubit-Medic
+title: QuantumScribe
 emoji: 🩺
 colorFrom: indigo
 colorTo: pink
@@ -19,7 +19,7 @@ license: mit
 short_description: OpenEnv RL env that teaches an LLM to decode quantum errors.
 ---
 
-# Qubit-Medic: An LLM Decoder for Quantum Error Correction
+# QuantumScribe: An LLM Decoder for Quantum Error Correction
 
 An LLM (Qwen2.5-3B-Instruct) learning to outperform a 50-year-old graph-matching algorithm (PyMatching) at decoding quantum surface-code syndromes — using verifiable physics rewards, not human preferences. DeepMind's AlphaQubit (*Nature* 2024, Bausch et al.) showed a transformer can beat strong classical decoders, but it cost Google millions of dollars and a custom architecture. We ship a 3B-parameter open model on a free Colab T4, trained with SFT + GRPO against a real Stim simulator behind an OpenEnv HTTP contract.
 
@@ -29,12 +29,12 @@ An LLM (Qwen2.5-3B-Instruct) learning to outperform a 50-year-old graph-matching
 
 - **HF Space (live demo + API):** [ronitraj/QuantumScribe](https://huggingface.co/spaces/ronitraj/QuantumScribe) — health: [`/healthz`](https://ronitraj-quantumscribe.hf.space/healthz)
 - **Trained LoRA on the Hub:** [ronitraj/quantumscribe](https://huggingface.co/ronitraj/quantumscribe)
-- **Colab notebook:** [`notebooks/colab_train.ipynb`](notebooks/colab_train.ipynb)
+- **Colab notebook (actual training run):** [`notebooks/meta_final.ipynb`](notebooks/meta_final.ipynb)
 - **2-min video:** <!-- TODO: replace with submission video URL -->TBD-replace
-- **Blog:** <!-- TODO: replace with blog post URL -->TBD-replace
+- **Blog for Everyone:** [`BLOG.md`](BLOG.md)
 - **W&B project:** [ronitraj/QuantumScribe-GRPO](https://wandb.ai/ronitraj/QuantumScribe-GRPO) · SFT [`yli513jl`](https://wandb.ai/ronitraj/QuantumScribe-GRPO/runs/yli513jl) · GRPO [`4p7eurnc`](https://wandb.ai/ronitraj/QuantumScribe-GRPO/runs/4p7eurnc)
 - **OpenEnv manifest:** [`openenv.yaml`](openenv.yaml)
-- **Mini-blog (judges' walkthrough):** [`BLOG.md`](BLOG.md)
+
 
 ---
 
@@ -90,7 +90,7 @@ Held-out eval on 1000 episodes at L2_target (`data/eval_grpo.json`, source-of-tr
 |:-:|:-:|
 | *Mean total episode reward across GRPO steps; x = step, y = mean reward (illustrative trajectory).* | *Fraction of episodes where the LLM is right and PyMatching is wrong; x = step, y = beat rate.* |
 
-> **Honest caveat.** On this slice `pymatching_beat = 0.0` — i.e. zero "beats" of PyMatching on the held-out set. High logical correction (96.4%) and overlap with the PM frame remain meaningful signals, but we are not yet claiming to outperform PyMatching at d=3. See [`qubit_medic/server/rewards.py`](qubit_medic/server/rewards.py) for definitions.
+> **Caveat** On this slice `pymatching_beat = 0.0` — i.e. zero "beats" of PyMatching on the held-out set. During training we are able to do better than Pymatching on some examples where PyMatching fails. High logical correction (96.4%) and overlap with the PM frame remain meaningful signals, but we are not yet claiming to outperform PyMatching at d=3. See [`qubit_medic/server/rewards.py`](qubit_medic/server/rewards.py) for definitions.
 
 ### Before / after comparison
 
@@ -141,7 +141,7 @@ Episodes are **single-step**: one completion per episode. The trainer and W&B se
 +----------+ <------------  +---------------------------+
 ```
 
-### Elevator pitch (technical)
+### Technical Specifications
 
 DeepMind's [AlphaQubit](https://www.nature.com/articles/s41586-024-08148-8) showed a transformer can beat a strong PyMatching baseline. We reimplement the *idea* with a commodity stack:
 
@@ -157,7 +157,7 @@ DeepMind's [AlphaQubit](https://www.nature.com/articles/s41586-024-08148-8) show
 | Baseline | PyMatching (sparse blossom) | Same class of MWM decoder |
 | Open source | This repo + Hub weights | Research partial |
 
-### Methodology checklist
+### Methodology
 
 | Concern | Status | Pointer |
 |--------|--------|--------|
@@ -286,7 +286,7 @@ python -m scripts.train_grpo \
 python -m scripts.eval --adapter checkpoints/grpo --episodes 1000 --out data/eval_grpo.json
 ```
 
-End-to-end: [notebooks/colab_train.ipynb](notebooks/colab_train.ipynb). Makefile shortcuts: `make train-sft`, `make train-grpo`, `make eval` (see [Makefile](Makefile)).
+End-to-end: [notebooks/meta_final.ipynb](notebooks/meta_final.ipynb). Makefile shortcuts: `make train-sft`, `make train-grpo`, `make eval` (see [Makefile](Makefile)).
 
 #### Local dev: run everything (no Docker)
 
@@ -377,7 +377,7 @@ scripts/
   validate_env.py, generate_sft_data.py, train_sft.py, train_grpo.py, eval.py
   baseline_policies.py, plot_results.py, plot_data_figures.py, animate_grid.py, willow_validation.py
   format_test.py, diversity_preflight.py, deploy_to_space.py, sync_kaggle_bundle.py
-tests/     data/     figures/     checkpoints/     notebooks/colab_train.ipynb
+tests/     data/     figures/     checkpoints/     notebooks/meta_final.ipynb
 app_gradio.py   Dockerfile   openenv.yaml   Makefile
 ```
 
