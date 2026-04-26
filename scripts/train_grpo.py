@@ -62,6 +62,19 @@ import inspect
 import json
 import os
 import random
+
+# torch._dynamo recompile-limit guard. Unsloth's GRPO trainer wraps the
+# loss/generation graph in torch.compile(fullgraph=True). Two things blow
+# past Dynamo's default cache_size_limit (8) over a long GRPO run:
+#   1. The mode-collapse hook mutates trainer.args.temperature in flight
+#      (e.g. 1.2 -> 1.4 -> 1.6 -> 1.8); each mutation re-specializes the
+#      compiled generation path.
+#   2. Variable prompt/completion shapes specialize over hundreds of steps.
+# When the limit is hit, fullgraph=True turns it into a fatal
+# FailOnRecompileLimitHit (we lost a run at step 400/1500 to this). Set the
+# limits high before torch is imported so they take effect everywhere.
+os.environ.setdefault("TORCHDYNAMO_CACHE_SIZE_LIMIT", "256")
+os.environ.setdefault("TORCHDYNAMO_RECOMPILE_LIMIT", "256")
 import shutil
 import sys
 import threading
@@ -667,17 +680,28 @@ def _build_wandb_callback(cache, model, tokenizer, env_client, eval_rows,
                 collapsed_count = sum(1 for u in last if u == 1)
                 if collapsed_count > inspection_collapse_threshold:
                     cur_temp = float(getattr(args, "temperature", 1.2))
-                    new_temp = cur_temp + temp_bump_on_collapse
-                    print(f"\n[grpo-inspection] WARN @ step {step}: "
-                          f"{collapsed_count}/{inspection_sample_n} of the "
-                          f"most recent prompts had ALL 4 generations identical. "
-                          f"Bumping rollout temperature {cur_temp:.2f} "
-                          f"-> {new_temp:.2f}.")
-                    try:
-                        args.temperature = new_temp
-                    except Exception as exc:
-                        print(f"[grpo-inspection] could not patch temperature "
-                              f"on TRL args: {exc!r}")
+                    # Cap the bump at 2.0 - going higher does not actually
+                    # produce more diversity (sampler is already at top-k=50
+                    # / top-p=0.95) and every distinct value re-specializes
+                    # the torch.compile cache, eventually tripping
+                    # FailOnRecompileLimitHit even with raised limits.
+                    new_temp = min(2.0, cur_temp + temp_bump_on_collapse)
+                    if new_temp <= cur_temp + 1e-6:
+                        print(f"\n[grpo-inspection] WARN @ step {step}: "
+                              f"{collapsed_count}/{inspection_sample_n} prompts "
+                              f"collapsed but temperature already at cap "
+                              f"({cur_temp:.2f}); leaving unchanged.")
+                    else:
+                        print(f"\n[grpo-inspection] WARN @ step {step}: "
+                              f"{collapsed_count}/{inspection_sample_n} of the "
+                              f"most recent prompts had ALL 4 generations "
+                              f"identical. Bumping rollout temperature "
+                              f"{cur_temp:.2f} -> {new_temp:.2f}.")
+                        try:
+                            args.temperature = new_temp
+                        except Exception as exc:
+                            print(f"[grpo-inspection] could not patch temperature "
+                                  f"on TRL args: {exc!r}")
                     wandb_utils.log({
                         "alarms/mode_collapse_count": collapsed_count,
                         "train/temperature_after_bump": new_temp,
@@ -1176,6 +1200,24 @@ def main(argv: Iterable[str] = ()) -> int:
     import torch
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
+
+    # Belt-and-suspenders for the dynamo recompile-limit crash that killed a
+    # previous run at step 400. Env vars at the top of the file cover the
+    # case where torch hasn't been imported yet; this block covers the case
+    # where unsloth/torch were already imported (env vars no-op then) and
+    # also flips suppress_errors so any future overflow falls back to eager
+    # instead of raising FailOnRecompileLimitHit.
+    try:
+        import torch._dynamo as _dynamo
+        for _attr in ("cache_size_limit", "recompile_limit",
+                      "accumulated_cache_size_limit"):
+            if hasattr(_dynamo.config, _attr):
+                setattr(_dynamo.config, _attr,
+                        max(256, getattr(_dynamo.config, _attr)))
+        _dynamo.config.suppress_errors = True
+    except Exception as _exc:  # pragma: no cover - defensive
+        print(f"[grpo-guard] WARNING: could not raise dynamo limits: "
+              f"{_exc!r}", file=sys.stderr)
 
     # Pre-flight signature check + stale-cache wipe.
     _wipe_stale_grpo_cache()

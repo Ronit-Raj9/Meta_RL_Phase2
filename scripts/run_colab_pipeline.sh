@@ -44,6 +44,14 @@ FORCE_SFT="${FORCE_SFT:-0}"
 # Lightning boxes).
 SKIP_PIP_INSTALL="${SKIP_PIP_INSTALL:-0}"
 
+# If launched from inside an existing checkout, reuse it instead of cloning
+# into a nested Meta_RL_Phase2/Meta_RL_Phase2 folder.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [[ -f "${ROOT_DIR}/requirements.txt" && -d "${ROOT_DIR}/qubit_medic" ]]; then
+  REPO_DIR="${ROOT_DIR}"
+fi
+
 if [[ ! -d "${REPO_DIR}" ]]; then
   git clone "${REPO_URL}" "${REPO_DIR}"
 fi
